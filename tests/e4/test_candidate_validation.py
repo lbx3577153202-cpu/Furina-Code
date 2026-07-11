@@ -7,6 +7,7 @@ from furina_code.contracts import ContractInvalid
 from furina_code.backend.candidate import (
     validate_candidate_file,
     validate_candidate_content,
+    read_candidate_once,
     create_candidate_envelope,
 )
 
@@ -123,12 +124,16 @@ class TestCreateCandidateEnvelope:
     def test_create(self, tmp_path):
         f = tmp_path / "candidate.json"
         f.write_text('{"schema_version": "1.0"}')
+        _, _, sha = read_candidate_once(str(f))
         ce = create_candidate_envelope(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
-            context_envelope_ref="sha256:abc",
-            candidate_path=str(f), backend_id="test",
+            candidate_type="repository_baseline_report",
+            backend_profile_ref="sha256:bp",
+            backend_session_ref="session-1",
+            context_ref="sha256:ctx",
+            content_ref="sha256:ct",
+            candidate_digest=sha,
         )
         assert ce.meta.object_type == "CandidateEnvelope"
-        assert ce.candidate_sha256.startswith("")
-        assert len(ce.candidate_sha256) == 64
+        assert len(ce.candidate_digest) == 64

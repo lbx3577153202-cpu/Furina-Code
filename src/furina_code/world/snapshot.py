@@ -19,6 +19,7 @@ def create_project_snapshot(
     correlation_id: str,
     workspace: str,
     snapshot_id: str | None = None,
+    causation_ref: str | None = None,
 ) -> ProjectSnapshot:
     """Observe workspace and create a ProjectSnapshot formal object."""
     git_obs = observe_git(workspace)
@@ -59,4 +60,5 @@ def create_project_snapshot(
         blind_spots=proj_obs["blind_spots"],
         snapshot_sha256=snapshot_sha256,
         snapshot_id=snapshot_id,
+        causation_ref=causation_ref,
     )

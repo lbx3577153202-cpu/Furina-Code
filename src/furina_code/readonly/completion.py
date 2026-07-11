@@ -11,54 +11,39 @@ def create_completion_verdict(
     task_run_id: str,
     project_ref: str,
     correlation_id: str,
+    task_revision: int,
     task_run_ref: str,
+    verification_ref: str,
     candidate_ref: str,
-    verdicts: list[VerificationVerdict],
+    outcome: str,
+    completed_items: tuple[str, ...] = (),
+    incomplete_items: tuple[str, ...] = (),
+    unverified_items: tuple[str, ...] = (),
+    residual_risks: tuple[str, ...] = (),
+    no_project_side_effect: bool = True,
+    user_effect: str = "",
+    reconciliation_refs: tuple[str, ...] = (),
     envelope_id: str | None = None,
+    causation_ref: str | None = None,
 ) -> CompletionVerdict:
-    """Aggregate VerificationVerdicts into a CompletionVerdict."""
-    completed: list[str] = []
-    failed: list[str] = []
-
-    for v in verdicts:
-        for cond in v.checked_conditions:
-            if cond in v.failed_conditions:
-                failed.append(cond)
-            else:
-                completed.append(cond)
-
-    if failed:
-        outcome = "failed"
-    elif completed:
-        outcome = "completed"
-    else:
-        outcome = "partial"
-
-    unverified: list[str] = []
-    residual: list[str] = []
-    if failed:
-        residual.append(f"Failed conditions: {', '.join(failed)}")
-
     return CompletionVerdict.create(
         run_binding_id=run_binding_id,
         task_id=task_id,
         task_run_id=task_run_id,
         project_ref=project_ref,
         correlation_id=correlation_id,
+        task_revision=task_revision,
         task_run_ref=task_run_ref,
+        verification_ref=verification_ref,
         candidate_ref=candidate_ref,
         outcome=outcome,
-        completed_items=tuple(completed),
-        incomplete_items=tuple(failed),
-        unverified_items=tuple(unverified),
-        residual_risks=tuple(residual),
-        user_effect=(
-            "No project files modified. No project tests run. "
-            "Project code correctness not verified. "
-            "Authorization Gate not implemented. "
-            "Controlled write not implemented. "
-            "RecoveryVerdict not implemented. "
-            "No experience formed."
-        ),
+        completed_items=completed_items,
+        incomplete_items=incomplete_items,
+        unverified_items=unverified_items,
+        residual_risks=residual_risks,
+        no_project_side_effect=no_project_side_effect,
+        user_effect=user_effect,
+        reconciliation_refs=reconciliation_refs,
         envelope_id=envelope_id,
+        causation_ref=causation_ref,
     )

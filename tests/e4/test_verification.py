@@ -7,6 +7,7 @@ from furina_code.readonly.verification import (
     verify_candidate_against_snapshot,
     execute_verification,
     ALL_STEPS,
+    CRITERIA_MAP,
 )
 
 
@@ -49,13 +50,13 @@ class TestVerifyAgainstSnapshot:
     def test_head_match(self):
         snap = _make_snapshot()
         cand = _make_candidate()
-        passed, msg = verify_candidate_against_snapshot(cand, snap, "snapshot_head_match")
+        passed, _ = verify_candidate_against_snapshot(cand, snap, "snapshot_head_match")
         assert passed is True
 
     def test_head_mismatch(self):
         snap = _make_snapshot()
         cand = _make_candidate(repository_head="b" * 40)
-        passed, msg = verify_candidate_against_snapshot(cand, snap, "snapshot_head_match")
+        passed, _ = verify_candidate_against_snapshot(cand, snap, "snapshot_head_match")
         assert passed is False
 
     def test_branch_match(self):
@@ -150,15 +151,18 @@ class TestExecuteVerification:
         plan = create_verification_plan(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
-            candidate_ref="sha256:abc", success_criteria=("HEAD",),
+            task_revision=1, candidate_ref="sha256:abc",
+            success_criteria_map=CRITERIA_MAP,
+            success_criteria=tuple(CRITERIA_MAP.keys()),
+            checks=ALL_STEPS,
         )
-        evidences, verdicts = execute_verification(
+        evidences, _, agg = execute_verification(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
             plan=plan, candidate_content=cand, snapshot=snap,
         )
-        assert len(verdicts) == len(ALL_STEPS)
-        assert all(v.outcome == "pass" for v in verdicts)
+        assert agg.outcome == "pass"
+        assert agg.coverage == 1.0
         assert len(evidences) == len(ALL_STEPS)
 
     def test_one_fails(self):
@@ -167,28 +171,52 @@ class TestExecuteVerification:
         plan = create_verification_plan(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
-            candidate_ref="sha256:abc", success_criteria=("HEAD",),
+            task_revision=1, candidate_ref="sha256:abc",
+            success_criteria_map=CRITERIA_MAP,
+            success_criteria=tuple(CRITERIA_MAP.keys()),
+            checks=ALL_STEPS,
         )
-        evidences, verdicts = execute_verification(
+        _, _, agg = execute_verification(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
             plan=plan, candidate_content=cand, snapshot=snap,
         )
-        head_verdict = [v for v in verdicts if "head" in v.checked_conditions[0]][0]
-        assert head_verdict.outcome == "fail"
+        assert agg.outcome == "fail"
+        assert "snapshot_head_match" in agg.failed_checks
 
-    def test_evidence_has_supporting_refs(self):
+    def test_evidence_has_causal_links(self):
         snap = _make_snapshot()
         cand = _make_candidate()
         plan = create_verification_plan(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
-            candidate_ref="sha256:abc", success_criteria=(),
+            task_revision=1, candidate_ref="sha256:abc",
+            success_criteria_map=CRITERIA_MAP,
+            success_criteria=tuple(CRITERIA_MAP.keys()),
+            checks=ALL_STEPS,
         )
-        evidences, _ = execute_verification(
+        evidences, _, _ = execute_verification(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
             plan=plan, candidate_content=cand, snapshot=snap,
         )
         for ev in evidences:
-            assert len(ev.supporting_refs) > 0
+            assert len(ev.causal_links) > 0
+
+    def test_evidence_refs_in_verdict(self):
+        snap = _make_snapshot()
+        cand = _make_candidate()
+        plan = create_verification_plan(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            task_revision=1, candidate_ref="sha256:abc",
+            success_criteria_map=CRITERIA_MAP,
+            success_criteria=tuple(CRITERIA_MAP.keys()),
+            checks=ALL_STEPS,
+        )
+        evidences, _, agg = execute_verification(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            plan=plan, candidate_content=cand, snapshot=snap,
+        )
+        assert len(agg.evidence_refs) == len(evidences)

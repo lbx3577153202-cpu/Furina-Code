@@ -9,6 +9,7 @@ from .errors import (
     StateTransitionInvalid,
     IntegrityCheckFailed,
     LedgerWriteFailed,
+    IdempotencyConflict,
 )
 from .meta import CanonicalMeta, SCHEMA_VERSION, now_utc, compute_integrity_ref, canonical_json_dumps
 from .objects import (
@@ -28,6 +29,7 @@ __all__ = [
     "StateTransitionInvalid",
     "IntegrityCheckFailed",
     "LedgerWriteFailed",
+    "IdempotencyConflict",
     "CanonicalMeta",
     "SCHEMA_VERSION",
     "now_utc",

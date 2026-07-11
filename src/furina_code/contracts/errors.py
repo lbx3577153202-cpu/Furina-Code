@@ -51,3 +51,9 @@ class LedgerWriteFailed(FurinaContractError):
     """Ledger could not complete the write."""
     def __init__(self, message: str, details: dict | None = None):
         super().__init__("LEDGER_WRITE_FAILED", message, details)
+
+
+class IdempotencyConflict(FurinaContractError):
+    """Different candidate submitted for an already-completed run."""
+    def __init__(self, message: str, details: dict | None = None):
+        super().__init__("IDEMPOTENCY_CONFLICT", message, details)

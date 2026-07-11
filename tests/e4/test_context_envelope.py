@@ -26,14 +26,15 @@ class TestContextEnvelope:
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
             project_ref="p", correlation_id="c",
             snapshot=snap, dossier=dossier,
+            backend_ref="sha256:bp",
         )
         assert ctx.meta.object_type == "ContextEnvelope"
-        assert ctx.instruction_profile_id == "e4-repository-baseline-v1"
-        assert "structured_goal" in ctx.context_payload
-        assert "snapshot_summary" in ctx.context_payload
+        assert ctx.purpose == "repository-baseline-observation"
+        assert ctx.context_digest.startswith("sha256:")
+        assert len(ctx.redactions) > 0
+        assert ctx.backend_ref == "sha256:bp"
 
-    def test_context_payload_filtered(self, tmp_path):
-        """Context packet should not contain absolute paths or secrets."""
+    def test_context_no_secrets(self, tmp_path):
         repo = str(Path(__file__).resolve().parents[2])
         snap = create_project_snapshot(
             run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
@@ -52,7 +53,6 @@ class TestContextEnvelope:
             project_ref="p", correlation_id="c",
             snapshot=snap, dossier=dossier,
         )
-        # No absolute paths in context_payload
         import json
         payload_str = json.dumps(ctx.context_payload)
         assert "E:\\" not in payload_str
