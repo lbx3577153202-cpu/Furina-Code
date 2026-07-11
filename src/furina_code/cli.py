@@ -30,6 +30,7 @@ from .readonly.verification import (
     create_verification_plan,
     execute_verification,
     build_gate_results,
+    evaluate_gate,
 )
 from .readonly.completion import create_completion_verdict
 
@@ -168,14 +169,23 @@ def _validate_workspace_path(workspace: str) -> None:
 
 
 def _validate_runtime_not_in_workspace(workspace: str, runtime_dir: str) -> None:
-    """Reject runtime-dir inside workspace."""
-    ws = Path(workspace).resolve()
+    """Reject runtime-dir inside the canonical repository root.
+
+    Uses observe_git to resolve the real repository root, so a workspace
+    like repo/tests/e4 correctly rejects repo/.furina-runtime.
+    """
+    from .world.git import observe_git
+    try:
+        git_obs = observe_git(workspace)
+        repo_root = Path(git_obs["repository_root"]).resolve()
+    except Exception:
+        repo_root = Path(workspace).resolve()
     rt = Path(runtime_dir).resolve()
     try:
-        rt.relative_to(ws)
-        raise ContractInvalid("runtime-dir must not be inside workspace")
+        rt.relative_to(repo_root)
+        raise ContractInvalid("runtime-dir must not be inside repository root")
     except ValueError:
-        pass  # rt is not inside ws — good
+        pass  # rt is not inside repo_root — good
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
@@ -654,9 +664,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         pre_gate_results: list = []
         pre_gates_all_pass = True
         for gid in pre_gate_ids:
-            from .readonly.verification import evaluate_gate
             gr = evaluate_gate(gid, rb_obj, td_obj, snapshot, bp_obj, ctx_obj,
-                               ce, vplan, agg_verdict, None, task_run=new_tr)
+                               ce, vplan, agg_verdict, None, task_run=new_tr,
+                               verification_evidence=evidences if gid == "IL-G6" else None)
             pre_gate_results.append(gr)
             if gr.outcome != "pass":
                 pre_gates_all_pass = False
@@ -716,9 +726,21 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             _write_obj(ledger, ev, "I4-C", 0)
 
         # --- Phase 2: Post-completion gate (IL-G7) ---
-        from .readonly.verification import evaluate_gate as eval_gate
-        g7_result = eval_gate("IL-G7", rb_obj, td_obj, snapshot, bp_obj, ctx_obj,
-                              ce, vplan, agg_verdict, cv, task_run=new_tr)
+        # Read current heads from Ledger for head verification
+        _cv_head_meta, _, _ = _load_latest_object(ledger, rb_id, "CompletionVerdict")
+        _vv_head_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationVerdict")
+        _tr_head_meta, _, _ = _load_latest_object(ledger, rb_id, "TaskRun")
+        current_heads = {}
+        if _cv_head_meta:
+            current_heads["CompletionVerdict"] = _cv_head_meta.integrity_ref
+        if _vv_head_meta:
+            current_heads["VerificationVerdict"] = _vv_head_meta.integrity_ref
+        if _tr_head_meta:
+            current_heads["TaskRun"] = _tr_head_meta.integrity_ref
+
+        g7_result = evaluate_gate("IL-G7", rb_obj, td_obj, snapshot, bp_obj, ctx_obj,
+                                  ce, vplan, agg_verdict, cv, task_run=new_tr,
+                                  current_heads=current_heads)
         g7_ev = EvidenceEnvelope.create(
             run_binding_id=rb_id,
             task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,

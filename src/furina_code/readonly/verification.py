@@ -307,6 +307,8 @@ def evaluate_gate(
     agg_verdict: VerificationVerdict | None,
     cv: CompletionVerdict | None,
     task_run: Any | None = None,
+    verification_evidence: list[EvidenceEnvelope] | None = None,
+    current_heads: dict[str, str] | None = None,
 ) -> GateResult:
     """Evaluate a single gate against actual formal objects."""
     from datetime import datetime, timezone
@@ -478,6 +480,36 @@ def evaluate_gate(
             conditions.append("evidence refs unique")
             if len(set(agg_verdict.evidence_refs)) != len(agg_verdict.evidence_refs):
                 failed.append("duplicate evidence refs found")
+
+            # Exact check-to-evidence mapping using actual EvidenceEnvelope objects
+            if verification_evidence is not None:
+                # Build map: check → evidence integrity_ref
+                check_to_evidence: dict[str, str] = {}
+                for ev in verification_evidence:
+                    # claim_scope is "verification:<check_name>"
+                    if ev.claim_scope.startswith("verification:"):
+                        check_name = ev.claim_scope.split(":", 1)[1]
+                        check_to_evidence[check_name] = ev.meta.integrity_ref
+
+                conditions.append("each check has exactly one evidence")
+                for check in vplan.checks:
+                    if check not in check_to_evidence:
+                        failed.append(f"check '{check}' has no evidence")
+                    elif check_to_evidence[check] not in agg_verdict.evidence_refs:
+                        failed.append(f"check '{check}' evidence not in verdict refs")
+
+                conditions.append("no extra verification evidence")
+                extra = set(check_to_evidence.keys()) - set(vplan.checks)
+                if extra:
+                    failed.append(f"extra evidence for checks not in plan: {extra}")
+
+                # Verdict refs must equal the required evidence set
+                required_ev_refs = frozenset(check_to_evidence.get(c, "") for c in vplan.checks)
+                actual_ev_refs = frozenset(agg_verdict.evidence_refs)
+                conditions.append("verdict refs equal required evidence set")
+                if required_ev_refs != actual_ev_refs:
+                    failed.append(f"verdict evidence_refs mismatch: required={len(required_ev_refs)} actual={len(actual_ev_refs)}")
+
             conditions.append("coverage == 1.0")
             if agg_verdict.coverage < 1.0:
                 failed.append(f"coverage={agg_verdict.coverage}")
@@ -497,9 +529,20 @@ def evaluate_gate(
         # CompletionVerdict honesty — run AFTER CompletionVerdict is written
         if cv is None:
             return GateResult(gate_id, "fail", ("CompletionVerdict exists",), (), ("CompletionVerdict missing",), now)
-        conditions.append("CompletionVerdict is current revision")
+        conditions.append("CompletionVerdict is current head")
         if cv.meta.revision < 1:
             failed.append("CompletionVerdict revision invalid")
+        # Verify current head from Ledger
+        if current_heads is not None:
+            if "CompletionVerdict" in current_heads:
+                if cv.meta.integrity_ref != current_heads["CompletionVerdict"]:
+                    failed.append("CompletionVerdict is not current head")
+            if "VerificationVerdict" in current_heads and agg_verdict is not None:
+                if agg_verdict.meta.integrity_ref != current_heads["VerificationVerdict"]:
+                    failed.append("VerificationVerdict is not current head")
+            if "TaskRun" in current_heads and task_run is not None:
+                if task_run.meta.integrity_ref != current_heads["TaskRun"]:
+                    failed.append("TaskRun is not current head")
         if agg_verdict is not None:
             conditions.append("verification_ref points to current VerificationVerdict")
             if cv.verification_ref != agg_verdict.meta.integrity_ref:
@@ -589,6 +632,7 @@ def build_gate_results(
     cv: CompletionVerdict | None = None,
     causation_ref: str | None = None,
     task_run: Any | None = None,
+    verification_evidence: list[EvidenceEnvelope] | None = None,
 ) -> tuple[list[EvidenceEnvelope], list[GateResult]]:
     """Build structured IL-G0/G1/G2/G4/G6/G7 gate evidence with real checks."""
     gate_ids = ("IL-G0", "IL-G1", "IL-G2", "IL-G4", "IL-G6", "IL-G7")
@@ -596,7 +640,8 @@ def build_gate_results(
     results: list[GateResult] = []
 
     for gate_id in gate_ids:
-        gr = evaluate_gate(gate_id, rb, td, snapshot, bp, ctx, ce, vplan, agg_verdict, cv, task_run=task_run)
+        gr = evaluate_gate(gate_id, rb, td, snapshot, bp, ctx, ce, vplan, agg_verdict, cv,
+                           task_run=task_run, verification_evidence=verification_evidence)
 
         ev = EvidenceEnvelope.create(
             run_binding_id=run_binding_id,

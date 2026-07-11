@@ -128,7 +128,9 @@ No authorize/act/reconcile in E4.
 ## 8. Test Results
 
 ```
-182/182 passed (78 E3 + 104 E4)
+265/265 passed (78 E3 + 187 E4)
+Python 3.12: SUCCESS
+Python 3.13: SUCCESS
 pip check: No broken requirements found
 ```
 
@@ -137,10 +139,13 @@ pip check: No broken requirements found
 ## 9. Real Repository Run
 
 ```
-prepare: rb-f82ceeadb19a
+result_head: 5f087f4fadb0a6f0fe8fb5fe4719156ed000d8d3
+branch: e4/read-only-real-loop
 finalize: outcome=completed
 10/10 verification steps passed
+6/6 read-only gates passed (IL-G0/G1/G2/G4/G6/G7)
 workspace unchanged
+runtime located outside repository root
 ```
 
 ---
@@ -159,9 +164,9 @@ workspace unchanged
 
 ## 11. Not Proven
 
-- Authorization Gate
-- Project write
-- Action receipt and reconciliation
+- Project-action Authorization Gate (E4 implements read-only gates only)
+- Controlled project write
+- ActionReceipt and RealityReconciliation
 - RecoveryVerdict
 - Experience growth
 - Full initial loop
@@ -170,9 +175,9 @@ workspace unchanged
 
 ## 12. Entering E5 Still Requires
 
-- Gate logic implementation
-- Controlled write action
-- Action receipt
-- Reality reconciliation
+- Project-action Authorization Gate
+- Controlled project write
+- ActionReceipt
+- RealityReconciliation
 - RecoveryVerdict
-- Experience candidate
+- Experience growth
