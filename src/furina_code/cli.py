@@ -9,7 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from .contracts.errors import FurinaContractError, IdempotencyConflict, ContractInvalid
+from .contracts.errors import FurinaContractError, IdempotencyConflict, ContractInvalid, GateNotSatisfied
 from .contracts.meta import canonical_json_dumps, now_utc, compute_integrity_ref
 from .contracts.objects import (
     RunBinding, TaskDossier, TaskRun, Checkpoint,
@@ -263,23 +263,24 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         )
         _write_obj(ledger, bp, "I2-B", 0)
 
-        # 4. TaskRun at intake/active
+        # 4. TaskRun at intake/active — causation_ref = TaskDossier
         tr = TaskRun.create(
             run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
             project_ref=proj, correlation_id=corr, task_revision=1,
+            causation_ref=td.meta.integrity_ref,
         )
         _write_obj(ledger, tr, "I2-D", 0)
 
-        # 5. intake/active → observe/active
+        # 5. intake/active → observe/active (supersedes chain from E3)
         tr = tr.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
         _write_obj(ledger, tr, "I2-D", 1)
 
-        # 6. ProjectSnapshot
+        # 6. ProjectSnapshot — causation_ref = observe/active TaskRun revision
         snapshot = create_project_snapshot(
             run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
             project_ref=proj, correlation_id=corr,
             workspace=workspace,
-            causation_ref=td.meta.integrity_ref,
+            causation_ref=tr.meta.integrity_ref,
         )
         _write_obj(ledger, snapshot, "I3-A", 0)
 
@@ -398,10 +399,16 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                 _, _, cand_digest = read_candidate_once(candidate_path)
                 ce_meta, ce_payload, _ = _load_latest_object(ledger, rb_id, "CandidateEnvelope")
                 if ce_meta is not None and ce_payload.get("candidate_digest") == cand_digest:
-                    # Same candidate replay — return original result
+                    # Same candidate replay — return complete core result from Ledger
+                    vp_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationPlan")
+                    vv_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationVerdict")
+                    tr_head_meta, _, _ = _load_latest_object(ledger, rb_id, "TaskRun")
                     print(canonical_json_dumps({
                         "candidate_ref": ce_meta.integrity_ref,
+                        "verification_plan_ref": vp_meta.integrity_ref if vp_meta else None,
+                        "verification_verdict_ref": vv_meta.integrity_ref if vv_meta else None,
                         "completion_verdict_ref": cv_meta.integrity_ref,
+                        "task_run_ref": tr_head_meta.integrity_ref if tr_head_meta else None,
                         "outcome": cv_payload["outcome"],
                         "completed_items": cv_payload.get("completed_items", []),
                         "incomplete_items": cv_payload.get("incomplete_items", []),
@@ -641,7 +648,47 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         new_tr = new_tr.transition("I2-D", Phase.ADJUDICATE, Disposition.ACTIVE)
         _write_obj(ledger, new_tr, "I2-D", new_tr.meta.revision - 1)
 
-        # CompletionVerdict
+        # --- Phase 1: Pre-completion gates (G0/G1/G2/G4/G6) ---
+        pre_gate_ids = ("IL-G0", "IL-G1", "IL-G2", "IL-G4", "IL-G6")
+        pre_gate_evidences: list = []
+        pre_gate_results: list = []
+        pre_gates_all_pass = True
+        for gid in pre_gate_ids:
+            from .readonly.verification import evaluate_gate
+            gr = evaluate_gate(gid, rb_obj, td_obj, snapshot, bp_obj, ctx_obj,
+                               ce, vplan, agg_verdict, None, task_run=new_tr)
+            pre_gate_results.append(gr)
+            if gr.outcome != "pass":
+                pre_gates_all_pass = False
+            # Build evidence for pre-gate
+            ev = EvidenceEnvelope.create(
+                run_binding_id=rb_id,
+                task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
+                project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
+                claim_scope=gid, evidence_type="gate_evaluation",
+                source_ref=f"gate:{gid}",
+                claim=f"{gid}: {gr.outcome}",
+                source_refs=gr.supporting_refs,
+                supporting_refs=tuple(
+                    obj.meta.integrity_ref for obj in [rb_obj, td_obj, snapshot, bp_obj, ctx_obj, ce, vplan, agg_verdict, new_tr]
+                    if obj is not None and hasattr(obj, 'meta')
+                ),
+                integrity_status="verified" if gr.outcome == "pass" else "failed",
+                envelope_id=f"{tr_meta.task_id}:gate:{gid}",
+                causation_ref=agg_verdict.meta.integrity_ref if agg_verdict else None,
+            )
+            gr.evidence_ref = ev.meta.integrity_ref
+            pre_gate_evidences.append(ev)
+
+        # --- CompletionVerdict: outcome depends on pre-gates + verification ---
+        verification_passed = agg_verdict.outcome == "pass"
+        if verification_passed and pre_gates_all_pass:
+            cv_outcome = "completed"
+        elif not verification_passed:
+            cv_outcome = "not_completed"
+        else:
+            cv_outcome = "manual_decision_required"
+
         cv = create_completion_verdict(
             run_binding_id=rb_id,
             task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
@@ -650,32 +697,89 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             task_run_ref=new_tr.meta.integrity_ref,
             verification_ref=agg_verdict.meta.integrity_ref,
             candidate_ref=ce.meta.integrity_ref,
-            outcome="completed" if agg_verdict.outcome == "pass" else "not_completed",
+            outcome=cv_outcome,
             completed_items=tuple(k for k, v in agg_verdict.criterion_results.items() if v == "pass"),
             incomplete_items=tuple(agg_verdict.failed_checks),
             unverified_items=tuple(agg_verdict.unknowns),
-            residual_risks=tuple(agg_verdict.failed_checks) if agg_verdict.failed_checks else (),
+            residual_risks=tuple(
+                list(agg_verdict.failed_checks) +
+                [gr.gate_id for gr in pre_gate_results if gr.outcome != "pass"]
+            ) if (agg_verdict.failed_checks or not pre_gates_all_pass) else (),
             no_project_side_effect=True,
             user_effect="No project files modified. No project tests run. Project code correctness not verified. Authorization Gate not implemented. Controlled write not implemented. RecoveryVerdict not implemented. No experience formed.",
             causation_ref=agg_verdict.meta.integrity_ref,
         )
         _write_obj(ledger, cv, "I4-E", 0)
 
-        # Build gate results with real objects (after CompletionVerdict so G7 can check it)
-        gate_evidences, gate_results_list = build_gate_results(
+        # Write pre-gate evidences
+        for ev in pre_gate_evidences:
+            _write_obj(ledger, ev, "I4-C", 0)
+
+        # --- Phase 2: Post-completion gate (IL-G7) ---
+        from .readonly.verification import evaluate_gate as eval_gate
+        g7_result = eval_gate("IL-G7", rb_obj, td_obj, snapshot, bp_obj, ctx_obj,
+                              ce, vplan, agg_verdict, cv, task_run=new_tr)
+        g7_ev = EvidenceEnvelope.create(
             run_binding_id=rb_id,
             task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
             project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
-            rb=rb_obj, td=td_obj, snapshot=snapshot,
-            bp=bp_obj, ctx=ctx_obj,
-            ce=ce, vplan=vplan, agg_verdict=agg_verdict, cv=cv,
+            claim_scope="IL-G7", evidence_type="gate_evaluation",
+            source_ref="gate:IL-G7",
+            claim=f"IL-G7: {g7_result.outcome}",
+            source_refs=g7_result.supporting_refs,
+            supporting_refs=tuple(
+                obj.meta.integrity_ref for obj in [cv, agg_verdict, new_tr]
+                if obj is not None and hasattr(obj, 'meta')
+            ),
+            integrity_status="verified" if g7_result.outcome == "pass" else "failed",
+            envelope_id=f"{tr_meta.task_id}:gate:IL-G7",
             causation_ref=cv.meta.integrity_ref,
-            task_run=new_tr,
         )
-        for gate_ev in gate_evidences:
-            _write_obj(ledger, gate_ev, "I4-C", 0)
+        g7_result.evidence_ref = g7_ev.meta.integrity_ref
+        _write_obj(ledger, g7_ev, "I4-C", 0)
 
-        # adjudicate/active → terminal/terminal
+        all_gate_results = pre_gate_results + [g7_result]
+
+        # --- G7 failure blocks terminal ---
+        if g7_result.outcome != "pass":
+            # TaskRun → adjudicate/paused (not terminal)
+            new_tr = new_tr.transition("I2-D", Phase.ADJUDICATE, Disposition.PAUSED)
+            _write_obj(ledger, new_tr, "I2-D", new_tr.meta.revision - 1)
+
+            # Non-terminal checkpoint
+            cp = Checkpoint.create(
+                run_binding_id=rb_id,
+                task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
+                project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
+                task_revision=2, phase=Phase.ADJUDICATE, disposition=Disposition.PAUSED,
+                event_cursor=ledger.get_last_sequence(rb_id),
+                pending_requests=(),
+                snapshot_ref=snapshot.meta.integrity_ref,
+                reason=f"G7 not satisfied — blocked terminal: {', '.join(g7_result.failed_conditions)}",
+                causation_ref=cv.meta.integrity_ref,
+            )
+            _write_obj(ledger, cp, "I1-C", 0)
+            ledger.close()
+
+            # Output with error
+            gate_summary = {}
+            for gr in all_gate_results:
+                gate_summary[gr.gate_id] = {
+                    "gate_id": gr.gate_id, "outcome": gr.outcome,
+                    "checked_conditions": list(gr.checked_conditions),
+                    "supporting_refs": list(gr.supporting_refs),
+                    "failed_conditions": list(gr.failed_conditions),
+                    "checked_at": gr.checked_at, "evidence_ref": gr.evidence_ref,
+                }
+            output = {
+                "error": "GATE_NOT_SATISFIED",
+                "message": f"IL-G7 failed: {', '.join(g7_result.failed_conditions)}",
+                "gate_results": gate_summary,
+            }
+            print(json.dumps(output), file=sys.stderr)
+            return 1
+
+        # --- G7 pass: proceed to terminal ---
         new_tr = new_tr.transition("I2-D", Phase.TERMINAL, Disposition.TERMINAL,
                                    terminal_reason=cv.outcome)
         _write_obj(ledger, new_tr, "I2-D", new_tr.meta.revision - 1)
@@ -698,7 +802,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
         # Build gate results summary for output
         gate_summary = {}
-        for gr in gate_results_list:
+        for gr in all_gate_results:
             gate_summary[gr.gate_id] = {
                 "gate_id": gr.gate_id,
                 "outcome": gr.outcome,

@@ -256,6 +256,7 @@ class TaskRun:
         project_ref: str,
         correlation_id: str,
         task_revision: int,
+        causation_ref: str | None = None,
     ) -> TaskRun:
         now = now_utc()
         payload = {
@@ -270,6 +271,7 @@ class TaskRun:
         meta, _ = _build_meta_and_integrity(
             "TaskRun", task_run_id, run_binding_id,
             task_id, task_run_id, project_ref, correlation_id, payload,
+            causation_ref=causation_ref,
         )
         return TaskRun(
             meta=meta, task_revision=task_revision,

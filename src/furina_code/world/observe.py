@@ -35,7 +35,15 @@ def _safe_resolve_check(path: Path, repo_root: Path) -> Path:
 
 
 def safe_observe_file(path: Path, repo_root: Path, max_bytes: int = MAX_FILE_BYTES) -> SafeFileObservation:
-    """Read a file with structured status reporting."""
+    """Read a file with structured status reporting.
+
+    Strict protocol:
+    - lstat/resolve/boundary check first
+    - stat size before any read
+    - oversized: return immediately, no read_bytes, sha256=None
+    - present: single read_bytes, compute sha256 from same bytes, strict UTF-8 decode
+    - No errors="replace" — invalid UTF-8 produces decode_failed
+    """
     # Symlink check first (before resolve)
     if path.is_symlink():
         return SafeFileObservation(status="symlink_rejected", reason=f"Path is a symlink: {path}")
@@ -56,25 +64,27 @@ def safe_observe_file(path: Path, repo_root: Path, max_bytes: int = MAX_FILE_BYT
     if not resolved.is_file():
         return SafeFileObservation(status="missing", reason=f"File not found: {path}")
 
-    # Size check
+    # Size check — do NOT read_bytes for oversized files
     size = resolved.stat().st_size
     if size > max_bytes:
-        sha = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
         return SafeFileObservation(
-            status="oversized", sha256=sha, size_bytes=size,
+            status="oversized", sha256=None, content=None, size_bytes=size,
             reason=f"File too large: {size} bytes (max {max_bytes})",
         )
 
-    # Read
+    # Single read_bytes for both sha256 and content
+    raw_bytes = resolved.read_bytes()
+    sha = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+
+    # Strict UTF-8 decode — no errors="replace"
     try:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
+        content = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
         return SafeFileObservation(
-            status="decode_failed", size_bytes=size,
-            reason=f"Decode failed: {type(exc).__name__}: {exc}",
+            status="decode_failed", sha256=None, content=None, size_bytes=size,
+            reason=f"Invalid UTF-8: {exc}",
         )
 
-    sha = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
     return SafeFileObservation(status="present", sha256=sha, content=content, size_bytes=size)
 
 

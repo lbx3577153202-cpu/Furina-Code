@@ -399,14 +399,16 @@ def evaluate_gate(
         conditions.append("branch set")
         if not snapshot.branch:
             failed.append("branch empty")
-        # Check if critical facts are unknown (should fail or be inconclusive)
+        # Check if critical facts are unknown due to rejection (not just missing)
         conditions.append("critical facts observed")
-        if snapshot.requires_python is None:
-            # This is a blind_spot, not necessarily a failure — but record it
-            pass
-        if not snapshot.pyproject_exists:
-            # pyproject missing is a significant blind spot
-            pass
+        _critical_unknown = False
+        for bs in snapshot.blind_spots:
+            if any(kw in bs.lower() for kw in ("symlink", "rejected", "oversized", "parse failed", "escape")):
+                _critical_unknown = True
+                break
+        if _critical_unknown:
+            failed.append("critical facts unknown due to security/size/parse rejection")
+        # Missing pyproject.toml is a blind_spot but not a gate failure
 
     elif gate_id == "IL-G4":
         # BackendProfile and disclosure
@@ -473,6 +475,9 @@ def evaluate_gate(
         if agg_verdict is not None:
             if len(agg_verdict.evidence_refs) < len(vplan.checks):
                 failed.append(f"fewer evidence refs ({len(agg_verdict.evidence_refs)}) than checks ({len(vplan.checks)})")
+            conditions.append("evidence refs unique")
+            if len(set(agg_verdict.evidence_refs)) != len(agg_verdict.evidence_refs):
+                failed.append("duplicate evidence refs found")
             conditions.append("coverage == 1.0")
             if agg_verdict.coverage < 1.0:
                 failed.append(f"coverage={agg_verdict.coverage}")
@@ -515,6 +520,19 @@ def evaluate_gate(
             failed.append("completed but has incomplete_items")
         if cv.outcome == "completed" and cv.unverified_items:
             failed.append("completed but has unverified_items")
+        # Check no overlap between completed/incomplete/unverified
+        _completed = set(cv.completed_items)
+        _incomplete = set(cv.incomplete_items)
+        _unverified = set(cv.unverified_items)
+        if _completed & _incomplete:
+            failed.append(f"completed/incomplete overlap: {_completed & _incomplete}")
+        if _completed & _unverified:
+            failed.append(f"completed/unverified overlap: {_completed & _unverified}")
+        if _incomplete & _unverified:
+            failed.append(f"incomplete/unverified overlap: {_incomplete & _unverified}")
+        # agg_verdict fail/inconclusive → CompletionVerdict must not be completed
+        if agg_verdict is not None and agg_verdict.outcome != "pass" and cv.outcome == "completed":
+            failed.append(f"VerificationVerdict={agg_verdict.outcome} but CompletionVerdict=completed")
         conditions.append("residual_risks stated if not completed")
         if cv.outcome != "completed" and not cv.residual_risks:
             failed.append("not completed but no residual_risks")
@@ -524,8 +542,34 @@ def evaluate_gate(
     else:
         return GateResult(gate_id, "inconclusive", (), (), (f"Unknown gate: {gate_id}",), now)
 
+    # Build supporting_refs based on gate type
+    supporting = []
+    if gate_id == "IL-G0":
+        for obj in (rb, td, task_run, snapshot):
+            if obj is not None and hasattr(obj, 'meta'):
+                supporting.append(obj.meta.integrity_ref)
+    elif gate_id == "IL-G1":
+        for obj in (td, task_run):
+            if obj is not None and hasattr(obj, 'meta'):
+                supporting.append(obj.meta.integrity_ref)
+    elif gate_id == "IL-G2":
+        if snapshot is not None and hasattr(snapshot, 'meta'):
+            supporting.append(snapshot.meta.integrity_ref)
+    elif gate_id == "IL-G4":
+        for obj in (bp, ctx, ce):
+            if obj is not None and hasattr(obj, 'meta'):
+                supporting.append(obj.meta.integrity_ref)
+    elif gate_id == "IL-G6":
+        for obj in (td, vplan, agg_verdict):
+            if obj is not None and hasattr(obj, 'meta'):
+                supporting.append(obj.meta.integrity_ref)
+    elif gate_id == "IL-G7":
+        for obj in (cv, agg_verdict, task_run):
+            if obj is not None and hasattr(obj, 'meta'):
+                supporting.append(obj.meta.integrity_ref)
+
     outcome = "fail" if failed else "pass"
-    return GateResult(gate_id, outcome, tuple(conditions), (), tuple(failed), now)
+    return GateResult(gate_id, outcome, tuple(conditions), tuple(supporting), tuple(failed), now)
 
 
 def build_gate_results(

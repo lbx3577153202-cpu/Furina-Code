@@ -71,7 +71,7 @@ class TestSafeFileObservation:
         obs = safe_observe_file(big, repo, max_bytes=1_000_000)
         assert obs.status == "oversized"
         assert obs.content is None
-        assert obs.sha256.startswith("sha256:")
+        assert obs.sha256 is None  # oversized files are not hashed
         assert obs.size_bytes == 2_000_000
 
     def test_parent_symlink_escape_rejected(self, tmp_path):
