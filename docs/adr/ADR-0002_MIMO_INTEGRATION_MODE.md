@@ -2,17 +2,19 @@
 
 **Date:** 2026-07-12
 **Stage:** MC0
-**Status:** Accepted
+**Status:** Candidate — activates only after PR merge
 
 ---
 
 ## 1. Decision
 
-**Selected Mode: A — Stable CLI Available**
+**Selected Mode: A — Stable CLI Transport Candidate**
 
-```
-MIMO_CODE_CLI_AVAILABLE
-```
+MiMo Code CLI is the selected integration transport candidate.
+
+It is not yet approved to run against the real repository.
+It is not yet proven read-only.
+It is not yet proven directory-contained.
 
 ---
 
@@ -28,23 +30,42 @@ Furina Code needs to determine how MiMo Code can serve as an external backend fo
 - `mimo run -- "message"` executes non-interactively
 - Produces stable exit code (0 on success)
 - Supports session management (`-c`, `-s`, `--fork`)
-- Supports working directory override (via `Set-Location` or `--dir`)
 - Supports model selection (`-m provider/model`)
 - Supports trust mode (`--trust`) and pure mode (`--pure`)
+- Working directory: shell-based; `--dir` flag exists but behavior unclear
 
 ### Probe Test
 - Read a file and returned exact expected text: `MIMO_PROBE_OK`
 - No files modified, no extra files created
 - Duration: ~10 seconds
+- Probe ran outside repository
 
 ### API Availability
-- Xiaomi API credential configured
+- Xiaomi API credential configured via CLI provider
 - Models available: mimo-auto, mimo-v2.5, mimo-v2.5-pro, mimo-v2.5-pro-ultraspeed
-- Direct API access not tested (CLI used instead)
+- Direct API access not tested
 
 ---
 
-## 4. Rejected Modes
+## 4. Mode A Meaning
+
+Mode A allows only:
+
+- Stable non-interactive CLI entry exists
+- Can produce stdout and exit codes
+- Can create and manage sessions
+- Can proceed to MC1 contract design
+
+Mode A does NOT mean:
+
+- Safe to automatically operate on real repository
+- Production-grade directory isolation
+- Read-only tool restriction
+- Reliable pure JSON output
+
+---
+
+## 5. Rejected Modes
 
 ### Mode B: API Available
 - Not rejected, but CLI is preferred because:
@@ -62,7 +83,7 @@ Furina Code needs to determine how MiMo Code can serve as an external backend fo
 
 ---
 
-## 5. Furina Code / MiMo Responsibility Boundary
+## 6. Furina Code / MiMo Responsibility Boundary
 
 | Responsibility | Owner |
 |---|---|
@@ -78,38 +99,96 @@ Furina Code needs to determine how MiMo Code can serve as an external backend fo
 
 ---
 
-## 6. Next Stage Scope
+## 7. MC1 Scope (Not E5)
 
-Design and implement:
+MC1 will design:
 
-1. **BackendPort** interface for MiMo Code CLI
-2. **MiMoCodeCLIAdapter** implementing BackendPort
-3. **Output template** for reliable JSON candidate generation
-4. **Timeout wrapper** for process management
-5. **Working directory override** for correct repository root
+1. **BackendPort** contract
+2. **FileBackend** adaptation
+3. **MiMoCodeCLIAdapter** contract and sandbox boundary design
+4. **Output template** for reliable JSON candidate generation
+5. **Timeout wrapper** for process management
 6. **Output parser** to extract JSON from potential extra text
 
----
-
-## 7. Implementation Requirements
-
-### For E5 (BackendPort + MiMoCodeCLIAdapter):
-- Adapter calls `mimo run -- "<prompt>" -m "mimo/mimo-auto" --trust --pure`
-- Working directory set to repository root (from `observe_git`)
-- Timeout via process kill after configurable seconds
-- Output parsing: extract JSON from stdout, handling potential extra text
-- Error handling: non-zero exit code, stderr capture
-- Session: new session per task (no `--continue`)
-
-### For File Bridge:
-- context_packet.json written by Furina Code
-- MiMo Code reads context_packet.json and generates candidate.json
-- Candidate must include exact context_envelope_ref, context_digest, backend_profile_ref
-- requested_actions must be empty
+MC1 does NOT implement E5 features:
+- Project-action Authorization Gate
+- Controlled project write
+- ActionReceipt
+- RealityReconciliation
 
 ---
 
-## 8. Constraints
+## 8. MC1 Sandbox Requirements
+
+MC1 does NOT allow MiMo CLI to use real repository root as writable working directory.
+
+First automated invocation must use:
+
+```
+runtime_root/
+└─ mimo-invocation/
+   ├─ context_packet.json
+   ├─ instruction.txt
+   └─ output/
+```
+
+This directory must be outside the real repository root.
+
+Before the following capabilities are proven:
+- Directory restriction
+- Read-only permission
+- Write prohibition
+- Session isolation
+- Structured output
+- Timeout with process tree termination
+
+MiMo CLI must NOT directly open the real repository.
+
+When code context is needed, use:
+- Controlled file copies
+- Or detached disposable worktrees
+
+Never use the real main working directory.
+
+---
+
+## 9. Legacy Contamination Isolation
+
+MC1 must enforce:
+
+- Do NOT inherit MiMo default working directory
+- Do NOT continue old sessions
+- Do NOT use `-c` or existing `-s` sessions
+- Do NOT let MC1 probe access legacy FurinaOS repository
+- Every invocation must create a new session
+- cwd must be explicitly set to runtime/sandbox
+- Context must only come from current ContextEnvelope
+
+Legacy trusted workspaces may remain in MiMo local config, but Furina Code must not depend on or access them.
+
+---
+
+## 10. Command Design Not Frozen
+
+The following are NOT yet verified and must NOT be hardcoded:
+
+- `--dir` always works: **unverified**
+- `--trust` always safe: **unverified**
+- `--pure` provides required isolation: **unverified**
+- `-m mimo/mimo-auto` is permanent model: **not fixed**
+- Direct use of real repository root: **prohibited**
+
+MC1 must detect actual flags and capabilities via BackendProbe at runtime.
+
+Model selection via BackendProfile/config, not permanently hardcoded.
+
+Unknown flag behavior must fail-closed.
+
+`--dangerously-skip-permissions` permanently prohibited.
+
+---
+
+## 11. Constraints
 
 - MiMo is an external backend, not part of Furina Code core
 - MiMo sessions are not long-term memory
@@ -120,7 +199,7 @@ Design and implement:
 
 ---
 
-## 9. Things Not to Implement
+## 12. Things Not to Implement
 
 - Direct MiMo API adapter (use CLI instead)
 - MiMo session as persistent memory
@@ -128,3 +207,4 @@ Design and implement:
 - MiMo Gateway or router
 - MiMo plugin system integration
 - MiMo MCP server integration
+- Any E5 features in MC1
