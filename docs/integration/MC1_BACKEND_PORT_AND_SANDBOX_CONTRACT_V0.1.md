@@ -1,8 +1,8 @@
 # MC1 Backend Port and Sandbox Contract V0.1
 
 **Date:** 2026-07-12
-**Stage:** MC1.0
-**Status:** Design draft
+**Stage:** MC1.1
+**Status:** Candidate — activates after merge
 
 ---
 
@@ -44,11 +44,20 @@ BackendPort and any Adapter must NOT:
 - Create CompletionVerdict
 - Decide task completion
 
+### 2.4 Dependency Boundary
+
+- Adapter does NOT receive Ledger instance
+- Adapter package must NOT import ledger module
+- Adapter package must NOT import formal object factories
+- Only orchestrator / I2-D may write Ledger and create CandidateEnvelope
+
 ---
 
 ## 3. MC1 Formal Objects (Non-Authoritative DTOs)
 
 These are plain, immutable DTOs. They are NOT added to OWNER_MAP.
+
+### 3.1 Probe DTOs
 
 ```python
 @dataclass(frozen=True)
@@ -64,49 +73,110 @@ class BackendProbeResult:
     supported_flags: tuple[str, ...]
     model_ids: tuple[str, ...]
     errors: tuple[str, ...]
+```
 
+### 3.2 Invocation Request
+
+```python
 @dataclass(frozen=True)
 class BackendInvocationRequest:
     run_binding_id: str
     invocation_id: str
+    backend_session_ref: str
     backend_profile_ref: str
     context_ref: str
     context_digest: str
     instruction_text: str
+    instruction_profile_ref: str
+    config_ref: str
+    sandbox_policy_ref: str
+    request_digest: str
     model_ref: str | None
     timeout_seconds: int
     max_stdout_bytes: int
     max_stderr_bytes: int
     fresh_session: bool
     sandbox_path: str
+```
 
+### 3.3 Invocation Plan
+
+```python
 @dataclass(frozen=True)
 class BackendInvocationPlan:
     request: BackendInvocationRequest
     executable_args: tuple[str, ...]
     cwd: str
     env_allowlist: dict[str, str]
+```
 
+### 3.4 Transport Result
+
+```python
 @dataclass(frozen=True)
 class BackendTransportResult:
     invocation_id: str
-    transport_status: str  # see Section 10
-    stdout_bytes: int | None
-    stderr_bytes: int | None
-    exit_code: int | None
-    duration_ms: int
+    request_digest: str
+    backend_session_ref: str
     provider_session_ref: str | None
+    provider_ref: str
+    executable_version: str
+    started_at: str  # ISO 8601
+    finished_at: str  # ISO 8601
+    command_args_digest: str
+
+    stdout_ref: str | None  # path to stdout.bin
+    stdout_digest: str | None
+    stdout_bytes: int
+    stdout_truncated: bool
+
+    stderr_ref: str | None  # path to stderr.bin
+    stderr_digest: str | None
+    stderr_bytes: int
+    stderr_truncated: bool
+
+    candidate_ref: str | None  # path to candidate.json (Furina-generated)
+    candidate_digest: str | None
+
+    manifest_before_ref: str | None
+    manifest_before_digest: str | None
+    manifest_after_ref: str | None
+    manifest_after_digest: str | None
+
+    transport_status: str  # see Section 10
+    error_code: str | None
     error_detail: str | None
+```
+
+### 3.5 Sandbox Manifest
+
+```python
+@dataclass(frozen=True)
+class SandboxFileEntry:
+    relative_path: str
+    entry_type: str  # "file" | "symlink" | "junction_or_reparse" | "directory"
+    size_bytes: int | None
+    sha256: str | None
+    is_symlink: bool
+    is_junction_or_reparse_point: bool
+    resolved_target: str | None  # must stay within sandbox
 
 @dataclass(frozen=True)
 class SandboxManifest:
     invocation_id: str
     sandbox_path: str
-    files_before: tuple[str, ...]
-    files_after: tuple[str, ...]
     cwd_resolved: str
-    symlinks_resolved: tuple[tuple[str, str], ...]
+    files_before: tuple[SandboxFileEntry, ...]
+    files_after: tuple[SandboxFileEntry, ...]
+    manifest_digest: str  # canonical SHA-256 of sorted entries
 ```
+
+Manifest rules:
+- Relative paths only
+- Deterministic sort (by relative_path)
+- Canonical SHA-256 digest of entire manifest
+- All resolved targets must stay within sandbox
+- Detects: new files, deleted files, content changes, type changes, link target changes
 
 ---
 
@@ -135,8 +205,8 @@ probe → prepare → invoke → collect → strict_validate → accepted | fail
 | probe | Confirm executable, version, flags, models |
 | prepare | Create sandbox outside repository; write instruction + context packet |
 | invoke | Run `mimo run -- "<prompt>"` with new session, cwd=sandbox |
-| collect | Capture bounded stdout/stderr; compute invocation summary |
-| strict_validate | Output must be exact JSON matching candidate schema |
+| collect | Stream-bounded capture of stdout/stderr; save stdout.bin |
+| strict_validate | stdout.bin must be exact JSON matching candidate schema |
 
 ### 4.3 FileBackend Preservation
 
@@ -156,7 +226,27 @@ FileBackend must:
 
 The entire stdout output from the adapter MUST be a single valid JSON object.
 
-### 5.2 Rejected Outputs
+### 5.2 Candidate Source Rule
+
+Fixed flow:
+
+```
+MiMo stdout
+→ save stdout.bin (raw transport evidence)
+→ bounded capture
+→ strict UTF-8 decode
+→ parse entire output as single JSON object
+→ existing Candidate contract validation
+→ Furina Code writes canonical candidate.json
+```
+
+明确:
+
+- MiMo does NOT directly write candidate.json
+- stdout.bin is the raw transport evidence
+- candidate.json is the Furina Code canonical copy generated after validation
+
+### 5.3 Rejected Outputs
 
 All of the following are protocol failures:
 
@@ -176,7 +266,7 @@ All of the following are protocol failures:
 | backend_profile_ref mismatch | `candidate_rejected` |
 | requested_actions non-empty | `candidate_rejected` |
 
-### 5.3 Heuristic Extraction Prohibition
+### 5.4 Heuristic Extraction Prohibition
 
 The adapter must NOT implement:
 
@@ -187,7 +277,7 @@ json_match = re.search(r'\{.*\}', output, re.DOTALL)
 
 The output is either valid JSON or it is a protocol error. No middle ground in MC1.
 
-### 5.4 Future Correction
+### 5.5 Future Correction
 
 A controlled correction request may be designed in a future stage, but MC1 must not silently sanitize model output.
 
@@ -219,7 +309,19 @@ Otherwise:
 provider_session_ref: null
 ```
 
-### 6.3 Prohibited Session Practices
+### 6.3 Session Rules
+
+Every new invocation MUST use:
+- New invocation_id
+- New backend_session_ref
+- New MiMo provider session (no `-c`, no `-s` with existing ID)
+
+Provider session reuse is NEVER allowed under any circumstances.
+
+What CAN be reused:
+- `succeeded` + immutable `BackendTransportResult` (not the MiMo session, but the transport evidence)
+
+### 6.4 Prohibited Session Practices
 
 - Do NOT use `-c` (continue last session)
 - Do NOT use `-s` with an existing session ID
@@ -264,18 +366,23 @@ provider_session_ref: null
 | No repo runtime | runtime must not be placed inside repository |
 | Before/after manifest | capture file list before and after invocation |
 
-### 7.3 Manifest Schema
+### 7.3 Manifest Requirements
 
-```json
-{
-  "invocation_id": "...",
-  "sandbox_path": "...",
-  "files_before": ["context_packet.json", "instruction.txt"],
-  "files_after": ["context_packet.json", "instruction.txt", "stdout.bin", "stderr.bin"],
-  "cwd_resolved": "...",
-  "symlinks_resolved": [["link", "target"], ...]
-}
+Each file entry records:
+
 ```
+relative_path
+entry_type (file | symlink | junction_or_reparse | directory)
+size_bytes
+sha256
+is_symlink
+is_junction_or_reparse_point
+resolved_target
+```
+
+All resolved targets must remain within sandbox.
+
+Manifest must detect: new files, deleted files, content changes, type changes, link target changes.
 
 ---
 
@@ -296,13 +403,31 @@ provider_session_ref: null
 
 Strategy: explicit allowlist only.
 
-```python
-ENV_ALLOWLIST = {
-    "HOME": "...",
-    "PATH": "...",
-    "TMPDIR": "...",
-}
+Must NOT pass raw `HOME` or `USERPROFILE` directly as safe environment.
+
+Must distinguish:
+
+- credential state
+- config state
+- session/database state
+- trusted workspace state
+- default working directory
+
+MC1 implementation must separately probe whether the following can be isolated:
+
+- config root
+- data/session root
+- workspace trust state
+- credential source
+
+If isolation is unavailable while preserving authentication:
+
 ```
+MiMoCodeCLIAdapter automated invocation: BLOCKED
+FileBackend: AVAILABLE
+```
+
+Explicit cwd does NOT substitute for user-level state isolation proof.
 
 Must NOT read, copy, or record:
 
@@ -328,6 +453,15 @@ May record:
 | stderr | configurable, default 1 MB |
 | Total runtime | configurable timeout |
 
+stdout and stderr must be stream-bounded captured.
+
+If either stream exceeds hard limit:
+- Terminate entire process tree
+- status = `output_too_large`
+- Record exceeded stream
+- Save truncated evidence
+- Prohibit further candidate parsing
+
 ### 8.4 Process Tree Termination
 
 On timeout:
@@ -349,9 +483,10 @@ At minimum, the request digest covers:
 backend_profile_ref
 context_ref
 context_digest
-instruction_profile
+instruction_profile_ref
+config_ref
+sandbox_policy_ref
 model/config ref
-sandbox policy
 timeout
 output size limits
 fresh-session policy
@@ -361,42 +496,80 @@ fresh-session policy
 
 | Scenario | Allowed |
 |---|---|
-| Same request digest + succeeded immutable result | Can reuse |
+| Same request digest + succeeded immutable result | Can reuse transport evidence |
 | Same request digest + timeout | Must NOT silently replay |
 | Same request digest + ambiguous | Must NOT silently replay |
-| Any new call | New invocation_id + new local backend_session_ref |
+| Any new call | New invocation_id + new backend_session_ref |
 
 ### 9.3 Prohibited
 
 - Continue old MiMo session
-- Reuse session after timeout
+- Reuse provider session after timeout
 - Guess session ownership
+- Reuse provider session under any circumstances
 
 ---
 
-## 10. TransportResult Status Collection
+## 10. TransportResult Status Collection (14 statuses)
 
-| Status | Retry | New invocation_id | Reuse session | TaskRun disposition | Allow completed |
+| Status | Retry | New invocation_id | Provider session | TaskRun suggestion | Allow completed |
 |---|---|---|---|---|---|
-| `succeeded` | no | no | yes | N/A | yes |
+| `succeeded` | no | no | new | N/A | candidate processing only |
 | `awaiting_external` | N/A | no | N/A | external_blocked | no |
-| `backend_unavailable` | yes | yes | no | paused | no |
-| `launch_failed` | yes | yes | no | paused | no |
-| `authentication_failed` | no | yes | no | manual_intervention | no |
-| `nonzero_exit` | yes | yes | no | paused | no |
-| `timeout` | controlled | yes | no | paused | no |
-| `cancelled` | yes | yes | no | paused | no |
-| `output_too_large` | yes | yes | no | paused | no |
-| `invalid_utf8` | yes | yes | no | paused | no |
-| `protocol_error` | yes | yes | no | paused | no |
-| `candidate_rejected` | controlled | yes | no | paused | no |
-| `ambiguous` | no | yes | no | paused | no |
+| `backend_unavailable` | yes | yes | new | deliberate/paused | no |
+| `launch_failed` | yes | yes | new | deliberate/paused | no |
+| `authentication_failed` | no | yes | new | deliberate/paused | no |
+| `nonzero_exit` | yes | yes | new | deliberate/paused | no |
+| `timeout` | controlled | yes | new | deliberate/paused | no |
+| `cancelled` | yes | yes | new | deliberate/paused | no |
+| `output_too_large` | yes | yes | new | deliberate/paused | no |
+| `invalid_utf8` | yes | yes | new | deliberate/paused | no |
+| `protocol_error` | yes | yes | new | deliberate/paused | no |
+| `candidate_rejected` | controlled | yes | new | deliberate/paused | no |
+| `sandbox_violation` | no | yes | new | deliberate/paused | no |
+| `ambiguous` | no | yes | new | deliberate/paused | no |
 
-### 10.1 Minimum Rules
+`sandbox_violation` covers:
+- Real repository access attempted
+- Legacy repository access attempted
+- Sandbox path escape
+- Symlink/junction/reparse point escape
+- Disallowed file changes
+- Manifest inconsistency
+
+Adapter NEVER auto-retries on sandbox_violation.
+
+### 10.1 TaskRun Mapping
+
+Adapter returns suggestions only. Adapter does NOT transition TaskRun.
+
+Suggested mappings:
+- `authentication_failed` → phase: deliberate, disposition: paused, open_request: "backend authentication required"
+- All other failures → phase: deliberate, disposition: paused
+
+### 10.2 Completion Semantics
+
+`transport_status == succeeded` ONLY allows entry to candidate processing. It does NOT imply task completion.
+
+Full completion chain required:
+
+```
+Transport succeeded
+→ exact JSON validation
+→ CandidateEnvelope
+→ VerificationPlan
+→ EvidenceEnvelope
+→ VerificationVerdict
+→ required Gates (G0/G1/G2/G4/G6/G7)
+→ CompletionVerdict
+```
+
+### 10.3 Minimum Rules
 
 - Authentication failure: no automatic retry
 - Protocol error: no silent sanitization in MC1
 - Timeout: must not assume no side effects; must not reuse session
+- Sandbox violation: no automatic retry
 - Ambiguous: pause and preserve evidence; must not declare completion
 - Any transport failure: Adapter must NOT directly modify TaskRun
 
@@ -424,14 +597,16 @@ MC1 implementation must pass at minimum:
 | BackendPort unknown provider fail-closed | raises error |
 | BackendProfile only created by I2-B | adapter write rejected |
 | Adapter cannot write Ledger | Ledger write rejected |
-| Real repository as cwd rejected | ContractInvalid |
-| Runtime inside repository rejected | ContractInvalid |
-| Legacy repository path rejected | ContractInvalid |
-| Symlink/junction escape rejected | ContractInvalid |
-| `-c` and `-s` rejected | Not used |
-| `--dangerously-skip-permissions` rejected | Not used |
+| Adapter does not receive Ledger instance | import error |
+| Real repository as cwd rejected | sandbox_violation |
+| Runtime inside repository rejected | sandbox_violation |
+| Legacy repository path rejected | sandbox_violation |
+| Symlink/junction escape rejected | sandbox_violation |
+| `-c` and `-s` rejected | not used |
+| `--dangerously-skip-permissions` rejected | not used |
 | Unknown flags not hardcoded | BackendProbe detects |
 | New session every invocation | verified |
+| Provider session never reused | verified |
 | stdout exceeds limit | output_too_large |
 | stderr exceeds limit | truncated, recorded |
 | Timeout enforced | process tree killed |
@@ -444,6 +619,12 @@ MC1 implementation must pass at minimum:
 | context digest mismatch rejected | candidate_rejected |
 | BackendProfile ref mismatch rejected | candidate_rejected |
 | requested_actions non-empty rejected | candidate_rejected |
+| Sandbox manifest captures changes | verified |
+| stdout.bin saved as raw evidence | verified |
+| candidate.json written by Furina Code | verified |
+| Heuristic JSON extraction absent | verified |
+| HOME/USERPROFILE not passed raw | verified |
+| Provider state isolation probed | verified |
 | FileBackend regression equivalence | all 270 tests pass |
 | Real repository unchanged before/after | git status clean |
 | Credentials not in logs, Ledger, or Git | verified |

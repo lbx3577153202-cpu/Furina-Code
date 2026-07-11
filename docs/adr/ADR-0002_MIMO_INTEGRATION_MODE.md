@@ -112,7 +112,9 @@ MC1 designs:
 3. **MiMoCodeCLIAdapter** contract and sandbox boundary
 4. **Strict exact-JSON output protocol** (no heuristic extraction)
 5. **Timeout wrapper** for process management
-6. **TransportResult status collection**
+6. **14 TransportResult status collection** (including sandbox_violation)
+7. **Candidate source rule**: stdout.bin is raw evidence, candidate.json is Furina-generated
+8. **Provider state isolation**: config/session/credential isolation must be probed before automation
 
 MC1 does NOT implement E5 features:
 - Project-action Authorization Gate
