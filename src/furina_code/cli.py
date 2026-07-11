@@ -15,7 +15,7 @@ from .contracts.objects import (
     RunBinding, TaskDossier, TaskRun, Checkpoint,
     BackendProfile, ContextEnvelope, CandidateEnvelope, ProjectSnapshot,
     EvidenceEnvelope, VerificationPlan, VerificationVerdict, CompletionVerdict,
-    Phase, Disposition,
+    Phase, Disposition, RunBindingStatus, TaskDossierStatus,
 )
 from .ledger.sqlite import Ledger
 from .world.snapshot import create_project_snapshot
@@ -204,18 +204,30 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         )
         _write_obj(ledger, rb, "I1-A", 0)
 
-        # 2. TaskDossier
+        # 2. TaskDossier with full 10 success criteria
         td = TaskDossier.create(
             run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
             project_ref=proj, correlation_id=corr,
             source_intent_ref="cli:inspect",
             structured_goal="Generate repository baseline report",
-            success_criteria=("HEAD observed", "branch observed", "working tree status", "dependencies cataloged"),
+            success_criteria=(
+                "HEAD observed",
+                "branch observed",
+                "working tree status",
+                "file counts correct",
+                "Python version cataloged",
+                "runtime deps cataloged",
+                "dev deps cataloged",
+                "pytest testpaths cataloged",
+                "CI config cataloged",
+                "blind spots recorded",
+            ),
             scope=("repository metadata",),
             exclusions=("source code analysis", "code quality", "security audit"),
             unknowns=(),
             risk_class="low",
             user_constraints=("read-only",),
+            causation_ref=rb.meta.integrity_ref,
         )
         _write_obj(ledger, td, "I2-A", 0)
 
@@ -453,10 +465,12 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         # Single-read candidate
         cand_text, cand_parsed, cand_digest = read_candidate_once(candidate_path)
 
-        # Validate candidate content
+        # Validate candidate content with strict schema and context digest
         validate_candidate_content(
-            cand_text, ctx_meta.integrity_ref,
-            bp_meta.integrity_ref if bp_meta else "e4-repository-baseline-v1",
+            cand_text,
+            expected_context_ref=ctx_meta.integrity_ref,
+            expected_context_digest=ctx_payload.get("context_digest", ""),
+            expected_backend_profile_ref=bp_meta.integrity_ref if bp_meta else "e4-repository-baseline-v1",
         )
 
         # Create CandidateEnvelope (only after all validation passes)
@@ -493,17 +507,30 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         new_tr = new_tr.transition("I2-D", Phase.VERIFY, Disposition.ACTIVE)
         _write_obj(ledger, new_tr, "I2-D", new_tr.meta.revision - 1)
 
-        # VerificationPlan
-        from .readonly.verification import ALL_STEPS, CRITERIA_MAP
+        # VerificationPlan — build from TaskDossier success_criteria
+        from .readonly.verification import CRITERIA_MAP
+        td_meta_loaded, td_payload_loaded, _ = _load_latest_object(ledger, rb_id, "TaskDossier")
+        td_criteria = tuple(td_payload_loaded.get("success_criteria", [])) if td_payload_loaded else tuple(CRITERIA_MAP.keys())
+        # Build criteria_map from dossier criteria using CRITERIA_MAP as registry
+        criteria_map = {}
+        checks_list = []
+        for crit in td_criteria:
+            check = CRITERIA_MAP.get(crit, crit)
+            criteria_map[crit] = check
+            checks_list.append(check)
+        required_ev = tuple(f"evidence:{c}" for c in checks_list)
         vplan = create_verification_plan(
             run_binding_id=rb_id,
             task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
             project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
             task_revision=tr_payload["task_revision"],
             candidate_ref=ce.meta.integrity_ref,
-            success_criteria_map=CRITERIA_MAP,
-            success_criteria=tuple(CRITERIA_MAP.keys()),
-            checks=ALL_STEPS,
+            success_criteria_map=criteria_map,
+            success_criteria=td_criteria,
+            checks=tuple(checks_list),
+            required_evidence=required_ev,
+            independence_requirements=("local deterministic verification",),
+            stop_conditions=("any_critical_check_fails",),
             causation_ref=ce.meta.integrity_ref,
         )
         _write_obj(ledger, vplan, "I4-D", 0)
@@ -522,18 +549,66 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             _write_obj(ledger, ev, "I4-C", 0)
         _write_obj(ledger, agg_verdict, "I4-D", 0)
 
-        # Build gate results
-        gate_results = build_gate_results(
-            run_binding_id=rb_id,
-            task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
-            project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
-            rb_meta=None, td_meta=None, snapshot=snapshot,
-            bp_meta=bp_meta, ctx_meta=ctx_meta, ce_meta=ce.meta,
-            vplan_meta=vplan.meta, agg_verdict=agg_verdict,
-            causation_ref=agg_verdict.meta.integrity_ref,
-        )
-        for gate_ev in gate_results:
-            _write_obj(ledger, gate_ev, "I4-C", 0)
+        # Load real objects for gate evaluation
+        from .contracts.objects import RunBinding as RB, TaskDossier as TD, BackendProfile as BPObj, ContextEnvelope as CtxObj
+        rb_obj = None
+        td_obj = None
+        bp_obj = None
+        ctx_obj = None
+        rb_meta_loaded, rb_payload_loaded, _ = _load_latest_object(ledger, rb_id, "RunBinding")
+        if rb_meta_loaded:
+            rb_obj = RB(
+                meta=rb_meta_loaded,
+                subject_ref=rb_payload_loaded.get("subject_ref", ""),
+                user_ref=rb_payload_loaded.get("user_ref", ""),
+                project_ref=rb_payload_loaded.get("project_ref", ""),
+                task_ref=rb_payload_loaded.get("task_ref", ""),
+                allowed_tool_classes=tuple(rb_payload_loaded.get("allowed_tool_classes", [])),
+                status=RunBindingStatus(rb_payload_loaded.get("status", "active")),
+                source_refs=tuple(rb_payload_loaded.get("source_refs", [])),
+            )
+        if td_meta_loaded:
+            td_obj = TD(
+                meta=td_meta_loaded,
+                source_intent_ref=td_payload_loaded.get("source_intent_ref", ""),
+                structured_goal=td_payload_loaded.get("structured_goal", ""),
+                success_criteria=tuple(td_payload_loaded.get("success_criteria", [])),
+                scope=tuple(td_payload_loaded.get("scope", [])),
+                exclusions=tuple(td_payload_loaded.get("exclusions", [])),
+                unknowns=tuple(td_payload_loaded.get("unknowns", [])),
+                risk_class=td_payload_loaded.get("risk_class", ""),
+                user_constraints=tuple(td_payload_loaded.get("user_constraints", [])),
+                status=TaskDossierStatus(td_payload_loaded.get("status", "active")),
+            )
+        if bp_meta and bp_payload:
+            bp_obj = BPObj(
+                meta=bp_meta,
+                provider_ref=bp_payload.get("provider_ref", ""),
+                capabilities=tuple(bp_payload.get("capabilities", [])),
+                limits=bp_payload.get("limits", {}),
+                health=bp_payload.get("health", ""),
+                credential_mode=bp_payload.get("credential_mode", ""),
+                data_policy_ref=bp_payload.get("data_policy_ref", ""),
+                last_checked_at=bp_meta.created_at,
+                backend_id=bp_payload.get("backend_id", ""),
+                backend_kind=bp_payload.get("backend_kind", ""),
+            )
+        if ctx_meta and ctx_payload:
+            ctx_obj = CtxObj(
+                meta=ctx_meta,
+                task_revision=ctx_payload.get("task_revision", 1),
+                purpose=ctx_payload.get("purpose", ""),
+                snapshot_ref=ctx_payload.get("snapshot_ref", ""),
+                task_dossier_ref=ctx_payload.get("task_dossier_ref", ""),
+                included_refs=tuple(ctx_payload.get("included_refs", [])),
+                redactions=tuple(ctx_payload.get("redactions", [])),
+                classification_summary=ctx_payload.get("classification_summary", ""),
+                disclosure_basis=ctx_payload.get("disclosure_basis", ""),
+                backend_ref=ctx_payload.get("backend_ref", ""),
+                instruction_profile=ctx_payload.get("instruction_profile", {}),
+                context_digest=ctx_payload.get("context_digest", ""),
+                context_payload=ctx_payload.get("context_payload", {}),
+            )
 
         # verify/active → adjudicate/active
         new_tr = new_tr.transition("I2-D", Phase.ADJUDICATE, Disposition.ACTIVE)
@@ -559,6 +634,19 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         )
         _write_obj(ledger, cv, "I4-E", 0)
 
+        # Build gate results with real objects (after CompletionVerdict so G7 can check it)
+        gate_evidences, gate_results_list = build_gate_results(
+            run_binding_id=rb_id,
+            task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
+            project_ref=tr_meta.project_ref, correlation_id=tr_meta.correlation_id,
+            rb=rb_obj, td=td_obj, snapshot=snapshot,
+            bp=bp_obj, ctx=ctx_obj,
+            ce=ce, vplan=vplan, agg_verdict=agg_verdict, cv=cv,
+            causation_ref=cv.meta.integrity_ref,
+        )
+        for gate_ev in gate_evidences:
+            _write_obj(ledger, gate_ev, "I4-C", 0)
+
         # adjudicate/active → terminal/terminal
         new_tr = new_tr.transition("I2-D", Phase.TERMINAL, Disposition.TERMINAL,
                                    terminal_reason=cv.outcome)
@@ -580,6 +668,19 @@ def cmd_finalize(args: argparse.Namespace) -> int:
 
         ledger.close()
 
+        # Build gate results summary for output
+        gate_summary = {}
+        for gr in gate_results_list:
+            gate_summary[gr.gate_id] = {
+                "gate_id": gr.gate_id,
+                "outcome": gr.outcome,
+                "checked_conditions": list(gr.checked_conditions),
+                "supporting_refs": list(gr.supporting_refs),
+                "failed_conditions": list(gr.failed_conditions),
+                "checked_at": gr.checked_at,
+                "evidence_ref": gr.evidence_ref,
+            }
+
         output = {
             "candidate_ref": ce.meta.integrity_ref,
             "evidence_ref": evidences[0].meta.integrity_ref if evidences else None,
@@ -593,6 +694,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             "unverified_items": list(cv.unverified_items),
             "residual_risks": list(cv.residual_risks),
             "user_effect": cv.user_effect,
+            "gate_results": gate_summary,
         }
         print(canonical_json_dumps(output))
         return 0

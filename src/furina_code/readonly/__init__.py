@@ -6,6 +6,8 @@ from .verification import (
     execute_verification,
     collect_evidence,
     build_gate_results,
+    evaluate_gate,
+    GateResult,
     ALL_STEPS,
     CRITERIA_MAP,
 )
@@ -18,6 +20,8 @@ __all__ = [
     "execute_verification",
     "collect_evidence",
     "build_gate_results",
+    "evaluate_gate",
+    "GateResult",
     "ALL_STEPS",
     "CRITERIA_MAP",
     "create_completion_verdict",

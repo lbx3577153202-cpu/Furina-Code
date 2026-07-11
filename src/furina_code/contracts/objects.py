@@ -205,6 +205,7 @@ class TaskDossier:
         unknowns: tuple[str, ...],
         risk_class: str,
         user_constraints: tuple[str, ...],
+        causation_ref: str | None = None,
     ) -> TaskDossier:
         payload = {
             "source_intent_ref": source_intent_ref,
@@ -220,6 +221,7 @@ class TaskDossier:
         meta, _ = _build_meta_and_integrity(
             "TaskDossier", task_id, run_binding_id,
             task_id, task_run_id, project_ref, correlation_id, payload,
+            causation_ref=causation_ref,
         )
         return TaskDossier(
             meta=meta, source_intent_ref=source_intent_ref,

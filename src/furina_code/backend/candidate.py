@@ -13,6 +13,34 @@ from ..contracts.objects import CandidateEnvelope
 
 MAX_CANDIDATE_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Required top-level fields and their expected types
+_REQUIRED_FIELDS = {
+    "schema_version": str,
+    "candidate_type": str,
+    "backend_profile_ref": str,
+    "backend_session_ref": str,
+    "context_ref": str,
+    "context_digest": str,
+    "content": dict,
+    "claimed_assumptions": list,
+    "requested_actions": list,
+}
+
+# Required content fields and their expected types
+_CONTENT_FIELDS = {
+    "repository_head": str,
+    "branch": str,
+    "working_tree": str,
+    "tracked_file_count": int,
+    "untracked_file_count": int,
+    "python_requires": (str, type(None)),
+    "runtime_dependencies": list,
+    "dev_dependencies": list,
+    "pytest_testpaths": list,
+    "ci_config": dict,
+    "blind_spots": list,
+}
+
 
 def _check_candidate_path(candidate_path: str) -> Path:
     """Validate candidate file path (no symlinks, no traversal)."""
@@ -55,58 +83,105 @@ def read_candidate_once(candidate_path: str) -> tuple[str, dict[str, Any], str]:
 
 
 def validate_candidate_file(candidate_path: str) -> tuple[str, str]:
-    """Validate that a candidate file exists and is readable.
-    Returns (content_text, sha256_hex).
-    """
+    """Validate that a candidate file exists and is readable."""
     text, _, sha256_hex = read_candidate_once(candidate_path)
     return text, sha256_hex
 
 
 def validate_candidate_content(
     content_text: str,
-    context_ref: str,
-    backend_ref: str,
+    expected_context_ref: str,
+    expected_context_digest: str,
+    expected_backend_profile_ref: str,
 ) -> dict[str, Any]:
-    """Parse and validate candidate JSON content. Returns parsed dict."""
+    """Parse and validate candidate JSON content with strict schema checks."""
     try:
         data = json.loads(content_text)
     except json.JSONDecodeError as exc:
         raise ContractInvalid(f"Candidate is not valid JSON: {exc}", {"error": str(exc)})
 
-    if data.get("schema_version") != "1.0":
-        raise ContractInvalid(
-            f"Unsupported candidate schema_version: {data.get('schema_version')}",
-            {"schema_version": data.get("schema_version")},
-        )
+    if not isinstance(data, dict):
+        raise ContractInvalid("Candidate must be a JSON object")
 
+    # Check required fields and types
+    for field, expected_type in _REQUIRED_FIELDS.items():
+        if field not in data:
+            raise ContractInvalid(f"Candidate missing required field: {field}")
+        if not isinstance(data[field], expected_type):
+            raise ContractInvalid(
+                f"Candidate field '{field}' has wrong type: expected {expected_type.__name__}, got {type(data[field]).__name__}",
+                {"field": field, "expected": expected_type.__name__, "got": type(data[field]).__name__},
+            )
+
+    # Schema version
+    if data["schema_version"] != "1.0":
+        raise ContractInvalid(f"Unsupported schema_version: {data['schema_version']}")
+
+    # Candidate type
     allowed_types = {"repository_baseline_report"}
-    if data.get("candidate_type") not in allowed_types:
-        raise ContractInvalid(
-            f"Unsupported candidate_type: {data.get('candidate_type')}",
-            {"candidate_type": data.get("candidate_type")},
-        )
+    if data["candidate_type"] not in allowed_types:
+        raise ContractInvalid(f"Unsupported candidate_type: {data['candidate_type']}")
 
-    if data.get("context_ref") != context_ref:
+    # Backend session ref must be non-empty
+    if not data["backend_session_ref"]:
+        raise ContractInvalid("backend_session_ref must be non-empty")
+
+    # Context ref
+    if data["context_ref"] != expected_context_ref:
         raise ContractInvalid(
             "Candidate context_ref does not match ContextEnvelope",
-            {"expected": context_ref, "got": data.get("context_ref")},
+            {"expected": expected_context_ref, "got": data["context_ref"]},
         )
 
-    if data.get("backend_profile_ref") != backend_ref:
+    # Context digest — strict match
+    if data["context_digest"] != expected_context_digest:
+        raise ContractInvalid(
+            "Candidate context_digest does not match ContextEnvelope",
+            {"expected": expected_context_digest, "got": data["context_digest"]},
+        )
+
+    # Backend profile ref
+    if data["backend_profile_ref"] != expected_backend_profile_ref:
         raise ContractInvalid(
             "Candidate backend_profile_ref does not match BackendProfile",
-            {"expected": backend_ref, "got": data.get("backend_profile_ref")},
+            {"expected": expected_backend_profile_ref, "got": data["backend_profile_ref"]},
         )
 
-    ra = data.get("requested_actions", [])
-    if ra:
+    # requested_actions must be empty list
+    if data["requested_actions"]:
         raise ContractInvalid(
             "Candidate requested_actions must be empty",
-            {"requested_actions": ra},
+            {"requested_actions": data["requested_actions"]},
         )
 
-    if "content" not in data:
-        raise ContractInvalid("Candidate missing 'content' section")
+    # claimed_assumptions must be list of strings
+    for i, item in enumerate(data["claimed_assumptions"]):
+        if not isinstance(item, str):
+            raise ContractInvalid(
+                f"claimed_assumptions[{i}] must be string, got {type(item).__name__}",
+            )
+
+    # Content must be a dict
+    content = data["content"]
+    if not isinstance(content, dict):
+        raise ContractInvalid("Candidate 'content' must be a JSON object")
+
+    # Validate content fields
+    for field, expected_type in _CONTENT_FIELDS.items():
+        if field not in content:
+            raise ContractInvalid(f"Candidate content missing required field: {field}")
+        if isinstance(expected_type, tuple):
+            if not isinstance(content[field], expected_type):
+                raise ContractInvalid(
+                    f"Content field '{field}' has wrong type",
+                    {"field": field},
+                )
+        else:
+            if not isinstance(content[field], expected_type):
+                raise ContractInvalid(
+                    f"Content field '{field}' has wrong type: expected {expected_type.__name__}",
+                    {"field": field},
+                )
 
     return data
 

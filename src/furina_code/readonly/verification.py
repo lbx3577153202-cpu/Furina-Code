@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,6 +12,13 @@ from ..contracts.objects import (
     VerificationPlan,
     VerificationVerdict,
     ProjectSnapshot,
+    RunBinding,
+    TaskDossier,
+    BackendProfile,
+    ContextEnvelope,
+    CandidateEnvelope,
+    CompletionVerdict,
+    RunBindingStatus,
 )
 
 # Built-in verification check names
@@ -40,6 +48,18 @@ CRITERIA_MAP = {
     "CI config cataloged": "snapshot_ci_config_match",
     "blind spots recorded": "snapshot_blind_spots_match",
 }
+
+
+@dataclass
+class GateResult:
+    """Non-informal value object for gate evaluation."""
+    gate_id: str
+    outcome: str  # "pass" | "fail" | "inconclusive"
+    checked_conditions: tuple[str, ...]
+    supporting_refs: tuple[str, ...]
+    failed_conditions: tuple[str, ...]
+    checked_at: str
+    evidence_ref: str | None = None
 
 
 def create_verification_plan(
@@ -193,10 +213,7 @@ def execute_verification(
     context_envelope_ref: str = "",
     candidate_envelope_ref: str = "",
 ) -> tuple[list[EvidenceEnvelope], list[dict], VerificationVerdict]:
-    """Run all steps, collect evidence, produce aggregate verdict.
-
-    Returns (evidences, per_step_results, aggregate_verdict).
-    """
+    """Run all steps, collect evidence, produce aggregate verdict."""
     evidences: list[EvidenceEnvelope] = []
     evidence_refs: list[str] = []
     criterion_results: dict[str, str] = {}
@@ -234,8 +251,8 @@ def execute_verification(
         evidence_refs.append(ev.meta.integrity_ref)
 
         # Map step back to criterion
-        criterion = step  # default: step IS the criterion
-        for crit_name, check_name in CRITERIA_MAP.items():
+        criterion = step
+        for crit_name, check_name in plan.success_criteria_map.items():
             if check_name == step:
                 criterion = crit_name
                 break
@@ -277,53 +294,177 @@ def execute_verification(
     return evidences, [], agg_verdict
 
 
+def evaluate_gate(
+    gate_id: str,
+    rb: RunBinding | None,
+    td: TaskDossier | None,
+    snapshot: ProjectSnapshot | None,
+    bp: BackendProfile | None,
+    ctx: ContextEnvelope | None,
+    ce: CandidateEnvelope | None,
+    vplan: VerificationPlan | None,
+    agg_verdict: VerificationVerdict | None,
+    cv: CompletionVerdict | None,
+) -> GateResult:
+    """Evaluate a single gate against actual formal objects."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conditions: list[str] = []
+    failed: list[str] = []
+
+    if gate_id == "IL-G0":
+        # RunBinding active; user/project/task consistent; git_read in tools
+        if rb is None:
+            return GateResult(gate_id, "fail", ("RunBinding exists",), (), ("RunBinding missing",), now)
+        conditions.append("RunBinding active")
+        if rb.status != RunBindingStatus.ACTIVE:
+            failed.append("RunBinding not active")
+        conditions.append("user/project/task consistent")
+        if rb.project_ref != (td.meta.project_ref if td else ""):
+            failed.append("project_ref mismatch")
+        conditions.append("git_read in tool classes")
+        if "git_read" not in rb.allowed_tool_classes:
+            failed.append("git_read not in allowed_tool_classes")
+        conditions.append("binding integrity valid")
+        if not rb.meta.integrity_ref.startswith("sha256:"):
+            failed.append("RunBinding integrity invalid")
+
+    elif gate_id == "IL-G1":
+        # TaskDossier completeness
+        if td is None:
+            return GateResult(gate_id, "fail", ("TaskDossier exists",), (), ("TaskDossier missing",), now)
+        for field in ("source_intent_ref", "structured_goal", "success_criteria", "scope", "exclusions", "unknowns", "user_constraints"):
+            conditions.append(f"{field} present")
+            val = getattr(td, field, None)
+            if val is None:
+                failed.append(f"{field} missing")
+        conditions.append("task revision present")
+        if td.meta.revision < 1:
+            failed.append("task revision invalid")
+
+    elif gate_id == "IL-G2":
+        # ProjectSnapshot validity
+        if snapshot is None:
+            return GateResult(gate_id, "fail", ("ProjectSnapshot exists",), (), ("ProjectSnapshot missing",), now)
+        conditions.append("observation_scope set")
+        if not snapshot.observation_scope:
+            failed.append("observation_scope empty")
+        conditions.append("freshness_policy set")
+        if not snapshot.freshness_policy:
+            failed.append("freshness_policy empty")
+        conditions.append("git_ref present")
+        if not snapshot.git_ref:
+            failed.append("git_ref empty")
+        conditions.append("file_facts present")
+        if not snapshot.file_facts:
+            failed.append("file_facts empty")
+        conditions.append("environment_facts present")
+        if not snapshot.environment_facts:
+            failed.append("environment_facts empty")
+        conditions.append("blind_spots recorded")
+        # blind_spots can be empty (that's valid — no blind spots)
+        if snapshot.blind_spots is None:
+            failed.append("blind_spots is None")
+
+    elif gate_id == "IL-G4":
+        # BackendProfile and disclosure
+        if bp is None:
+            return GateResult(gate_id, "fail", ("BackendProfile exists",), (), ("BackendProfile missing",), now)
+        conditions.append("BackendProfile health available")
+        if bp.health != "available":
+            failed.append(f"BackendProfile health={bp.health}")
+        if ctx is not None:
+            conditions.append("ContextEnvelope.backend_ref matches")
+            if ctx.backend_ref != bp.meta.integrity_ref:
+                failed.append("backend_ref mismatch")
+            conditions.append("context_digest present")
+            if not ctx.context_digest:
+                failed.append("context_digest empty")
+            conditions.append("disclosure rules present")
+            if not ctx.redactions:
+                failed.append("redactions empty")
+        if ce is not None:
+            conditions.append("CandidateEnvelope bound to context")
+            if ce.context_ref != (ctx.meta.integrity_ref if ctx else ""):
+                failed.append("candidate context_ref mismatch")
+            conditions.append("requested_actions empty")
+            if ce.requested_actions:
+                failed.append("requested_actions not empty")
+
+    elif gate_id == "IL-G6":
+        # Verification completeness
+        if vplan is None:
+            return GateResult(gate_id, "fail", ("VerificationPlan exists",), (), ("VerificationPlan missing",), now)
+        conditions.append("success criteria fully mapped")
+        if td is not None:
+            td_criteria = set(td.success_criteria)
+            plan_criteria = set(vplan.success_criteria_map.keys())
+            if td_criteria != plan_criteria:
+                failed.append(f"criteria mismatch: dossier={td_criteria} plan={plan_criteria}")
+        conditions.append("all checks have evidence")
+        if agg_verdict is not None:
+            if len(agg_verdict.evidence_refs) < len(vplan.checks):
+                failed.append("fewer evidence refs than checks")
+            conditions.append("coverage == 1.0")
+            if agg_verdict.coverage < 1.0:
+                failed.append(f"coverage={agg_verdict.coverage}")
+            conditions.append("no critical unknowns")
+            if agg_verdict.unknowns:
+                failed.append(f"unknowns: {agg_verdict.unknowns}")
+
+    elif gate_id == "IL-G7":
+        # CompletionVerdict honesty
+        if cv is None:
+            return GateResult(gate_id, "fail", ("CompletionVerdict exists",), (), ("CompletionVerdict missing",), now)
+        if agg_verdict is not None:
+            conditions.append("verification_ref current")
+            if cv.verification_ref != agg_verdict.meta.integrity_ref:
+                failed.append("verification_ref mismatch")
+        conditions.append("no_project_side_effect true")
+        if not cv.no_project_side_effect:
+            failed.append("no_project_side_effect is false")
+        conditions.append("user_effect describes limitations")
+        if "not modified" not in cv.user_effect.lower() and "not implemented" not in cv.user_effect.lower():
+            failed.append("user_effect does not describe limitations")
+        conditions.append("completed/incomplete semantically consistent")
+        if cv.outcome == "completed" and cv.incomplete_items:
+            failed.append("completed but has incomplete_items")
+        conditions.append("residual_risks stated if incomplete")
+        if cv.outcome != "completed" and not cv.residual_risks:
+            failed.append("not completed but no residual_risks")
+
+    else:
+        return GateResult(gate_id, "inconclusive", (), (), (f"Unknown gate: {gate_id}",), now)
+
+    outcome = "fail" if failed else "pass"
+    return GateResult(gate_id, outcome, tuple(conditions), (), tuple(failed), now)
+
+
 def build_gate_results(
     run_binding_id: str,
     task_id: str,
     task_run_id: str,
     project_ref: str,
     correlation_id: str,
-    rb_meta, td_meta, snapshot, bp_meta, ctx_meta, ce_meta,
-    vplan_meta, agg_verdict,
+    rb: RunBinding | None,
+    td: TaskDossier | None,
+    snapshot: ProjectSnapshot | None,
+    bp: BackendProfile | None,
+    ctx: ContextEnvelope | None,
+    ce: CandidateEnvelope | None,
+    vplan: VerificationPlan | None,
+    agg_verdict: VerificationVerdict | None,
+    cv: CompletionVerdict | None = None,
     causation_ref: str | None = None,
-) -> list[EvidenceEnvelope]:
-    """Build structured IL-G0/G1/G2/G4/G6/G7 gate evidence."""
-    gates = []
+) -> tuple[list[EvidenceEnvelope], list[GateResult]]:
+    """Build structured IL-G0/G1/G2/G4/G6/G7 gate evidence with real checks."""
+    gate_ids = ("IL-G0", "IL-G1", "IL-G2", "IL-G4", "IL-G6", "IL-G7")
+    evidences: list[EvidenceEnvelope] = []
+    results: list[GateResult] = []
 
-    gate_checks = {
-        "IL-G0": {
-            "scope": "RunBinding and identity",
-            "conditions": ["RunBinding active", "user/project/task consistent", "git_read in tool classes"],
-            "result": "pass",
-        },
-        "IL-G1": {
-            "scope": "TaskDossier completeness",
-            "conditions": ["structured_goal present", "success_criteria present", "scope present", "exclusions present", "unknowns present"],
-            "result": "pass",
-        },
-        "IL-G2": {
-            "scope": "ProjectSnapshot validity",
-            "conditions": ["snapshot_scope valid", "freshness_policy set", "blind_spots recorded"],
-            "result": "pass",
-        },
-        "IL-G4": {
-            "scope": "BackendProfile and disclosure",
-            "conditions": ["BackendProfile available", "disclosure compliant", "candidate bound correctly", "no requested_actions"],
-            "result": "pass",
-        },
-        "IL-G6": {
-            "scope": "Verification completeness",
-            "conditions": ["success criteria fully mapped", "evidence lineage complete", "critical checks executed"],
-            "result": "pass" if agg_verdict.outcome == "pass" else "fail",
-        },
-        "IL-G7": {
-            "scope": "CompletionVerdict honesty",
-            "conditions": ["verification_ref current", "completed/incomplete/unverified honest", "residual risks stated"],
-            "result": "pass" if agg_verdict.outcome == "pass" else "fail",
-        },
-    }
+    for gate_id in gate_ids:
+        gr = evaluate_gate(gate_id, rb, td, snapshot, bp, ctx, ce, vplan, agg_verdict, cv)
 
-    for gate_id, gate_info in gate_checks.items():
         ev = EvidenceEnvelope.create(
             run_binding_id=run_binding_id,
             task_id=task_id,
@@ -333,14 +474,16 @@ def build_gate_results(
             claim_scope=gate_id,
             evidence_type="gate_evaluation",
             source_ref=f"gate:{gate_id}",
-            claim=f"{gate_id}: {gate_info['scope']} — {gate_info['result']}",
-            source_refs=tuple(),
-            causal_links=(vplan_meta.integrity_ref,) if vplan_meta else (),
-            supporting_refs=(agg_verdict.meta.integrity_ref,),
-            integrity_status="verified",
+            claim=f"{gate_id}: {gr.outcome} — checked {len(gr.checked_conditions)} conditions, {len(gr.failed_conditions)} failed",
+            source_refs=gr.supporting_refs,
+            causal_links=(vplan.meta.integrity_ref,) if vplan else (),
+            supporting_refs=(agg_verdict.meta.integrity_ref,) if agg_verdict else (),
+            integrity_status="verified" if gr.outcome == "pass" else "failed",
             envelope_id=f"{task_id}:gate:{gate_id}",
             causation_ref=causation_ref,
         )
-        gates.append(ev)
+        gr.evidence_ref = ev.meta.integrity_ref
+        evidences.append(ev)
+        results.append(gr)
 
-    return gates
+    return evidences, results
