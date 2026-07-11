@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
+from ..contracts.errors import BindingMismatch
 from ..contracts.meta import CanonicalMeta
 from ..contracts.states import Phase, Disposition
 from ..ledger.sqlite import Ledger
@@ -22,11 +22,21 @@ class ContinuityView:
 
 
 def rebuild_continuity(ledger: Ledger, run_binding_id: str) -> ContinuityView:
-    """Rebuild ContinuityView from validated events and current TaskRun state."""
-    events = ledger.get_events(run_binding_id)
-    last_seq = ledger.get_last_sequence()
+    """Rebuild ContinuityView from verified events and current TaskRun state.
 
-    # Find latest TaskRun from events
+    Uses only verified (integrity-checked) events.  ``last_event_sequence`` is
+    scoped to the given *run_binding_id*, not the global maximum.  Raises
+    ``BindingMismatch`` when the binding has no events (fail-closed).
+    """
+    events = ledger.get_verified_events(run_binding_id)
+    last_seq = ledger.get_last_sequence(run_binding_id)
+
+    if not events:
+        raise BindingMismatch(
+            f"No events found for run_binding_id={run_binding_id}",
+            {"run_binding_id": run_binding_id},
+        )
+
     task_run_events = [
         e for e in events
         if e["event_type"].startswith("TaskRun.")
@@ -44,12 +54,9 @@ def rebuild_continuity(ledger: Ledger, run_binding_id: str) -> ContinuityView:
             source_cursor=None,
         )
 
-    # Get the latest TaskRun revision from the last event
     latest_event = task_run_events[-1]
-    # Parse aggregate_ref to get object_id
     parts = latest_event["aggregate_ref"].split(":", 1)
     task_run_id = parts[1] if len(parts) == 2 else parts[0]
-    revision = latest_event["aggregate_revision"]
 
     result = ledger.get_latest("TaskRun", task_run_id)
     if result is None:
@@ -63,14 +70,9 @@ def rebuild_continuity(ledger: Ledger, run_binding_id: str) -> ContinuityView:
             source_cursor=None,
         )
 
-    meta, payload = result
+    _, payload = result
 
-    # Find latest Checkpoint
-    checkpoint_events = [
-        e for e in events
-        if e["event_type"].startswith("Checkpoint.")
-    ]
-
+    checkpoint_events = [e for e in events if e["event_type"].startswith("Checkpoint.")]
     event_cursor = 0
     if checkpoint_events:
         latest_cp_event = checkpoint_events[-1]

@@ -1,6 +1,10 @@
 """E3 tests — restart continuity rebuild."""
 
-from furina_code.contracts import RunBinding, TaskDossier, TaskRun, Checkpoint, Phase, Disposition
+import pytest
+from furina_code.contracts import (
+    RunBinding, TaskDossier, TaskRun, Checkpoint,
+    Phase, Disposition, BindingMismatch,
+)
 from furina_code.ledger import Ledger
 from furina_code.continuity import rebuild_continuity
 
@@ -60,8 +64,7 @@ class TestRestartContinuity:
         }, caller_organ="I2-D", expected_revision=0)
 
         # Transition TaskRun: intake/active -> observe/active
-        tr2 = tr.transition("I2-D", "rb-1", "t-1", "tr-1", "proj-1", "corr-1",
-                           Phase.OBSERVE, Disposition.ACTIVE)
+        tr2 = tr.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
         ledger.write_object(tr2.meta, {
             "task_revision": tr2.task_revision, "phase": tr2.phase.value,
             "disposition": tr2.disposition.value, "current_refs": [],
@@ -102,4 +105,38 @@ class TestRestartContinuity:
         assert view.open_request_refs == ()
         assert view.unresolved_action_refs == ()
 
+        ledger2.close()
+
+    def test_rebuild_uses_verified_events(self, tmp_path):
+        """rebuild_continuity must use get_verified_events, not raw get_events."""
+        import sqlite3 as _sqlite3
+        db_path = str(tmp_path / "test.sqlite3")
+        ledger = Ledger(db_path)
+        ledger.open()
+
+        rb = RunBinding.create(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="proj-1", correlation_id="corr-1",
+            subject_ref="user-1", user_ref="user-1", task_ref="task-1",
+            allowed_tool_classes=("file_write",), source_refs=("s1",),
+        )
+        ledger.write_object(rb.meta, {
+            "subject_ref": rb.subject_ref, "user_ref": rb.user_ref,
+            "project_ref": rb.project_ref, "task_ref": rb.task_ref,
+            "allowed_tool_classes": list(rb.allowed_tool_classes),
+            "status": rb.status.value, "source_refs": list(rb.source_refs),
+        }, caller_organ="I1-A", expected_revision=0)
+
+        ledger.close()
+
+        # Tamper with the event
+        conn = _sqlite3.connect(db_path)
+        conn.execute("UPDATE event_envelopes SET event_type='TAMPERED' WHERE sequence=1")
+        conn.commit()
+        conn.close()
+
+        ledger2 = Ledger(db_path)
+        ledger2.open()
+        with pytest.raises(Exception):
+            rebuild_continuity(ledger2, "rb-1")
         ledger2.close()

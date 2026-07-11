@@ -15,7 +15,13 @@ from ..contracts.errors import (
     IntegrityCheckFailed,
     LedgerWriteFailed,
 )
-from ..contracts.meta import CanonicalMeta, compute_integrity_ref, SCHEMA_VERSION, now_utc
+from ..contracts.meta import (
+    CanonicalMeta,
+    compute_integrity_ref,
+    canonical_json_dumps,
+    SCHEMA_VERSION,
+    now_utc,
+)
 from ..contracts.objects import OWNER_MAP, check_owner
 
 SCHEMA_SQL = """
@@ -59,6 +65,18 @@ CREATE TABLE IF NOT EXISTS event_envelopes (
 );
 """
 
+# Stable identity fields that must not change across revisions.
+_STABLE_FIELDS = (
+    "schema_version",
+    "object_type",
+    "object_id",
+    "owner_organ",
+    "run_binding_id",
+    "task_id",
+    "task_run_id",
+    "project_ref",
+)
+
 
 class Ledger:
     """SQLite-backed append-only ledger for formal objects and events."""
@@ -88,6 +106,8 @@ class Ledger:
         if self._conn is None:
             raise LedgerWriteFailed("Ledger is not open")
         return self._conn
+
+    # ------------------------------------------------------------------ read
 
     def _load_meta(self, row: tuple) -> CanonicalMeta:
         d = json.loads(row[2])
@@ -120,24 +140,46 @@ class Ledger:
 
     def get_revision(self, object_type: str, object_id: str, revision: int) -> tuple[CanonicalMeta, dict] | None:
         cur = self.conn.execute(
-            "SELECT object_type, object_id, meta_json, payload_json, integrity_ref FROM object_revisions "
-            "WHERE object_type=? AND object_id=? AND revision=?",
+            "SELECT object_type, object_id, meta_json, payload_json, integrity_ref "
+            "FROM object_revisions WHERE object_type=? AND object_id=? AND revision=?",
             (object_type, object_id, revision),
         )
         row = cur.fetchone()
         if row is None:
             return None
+
+        stored_integrity_ref = row[4]
         meta = self._load_meta((row[0], row[1], row[2]))
         payload = json.loads(row[3])
-        stored_ref = row[4]
-        # Verify integrity
+
+        # Cross-check: column values vs meta JSON values
+        if row[0] != meta.object_type:
+            raise IntegrityCheckFailed(
+                "Column object_type mismatch with meta_json",
+                {"column": row[0], "meta": meta.object_type},
+            )
+        if row[1] != meta.object_id:
+            raise IntegrityCheckFailed(
+                "Column object_id mismatch with meta_json",
+                {"column": row[1], "meta": meta.object_id},
+            )
+
+        # Cross-check: stored integrity_ref in column vs in meta_json
+        if stored_integrity_ref != meta.integrity_ref:
+            raise IntegrityCheckFailed(
+                "integrity_ref column differs from meta_json integrity_ref",
+                {"column": stored_integrity_ref, "meta_json": meta.integrity_ref},
+            )
+
+        # Recompute and verify integrity
         meta_fields = meta.meta_fields_for_integrity()
         expected_ref = compute_integrity_ref(meta_fields, payload)
-        if stored_ref != expected_ref:
+        if stored_integrity_ref != expected_ref:
             raise IntegrityCheckFailed(
                 f"Integrity mismatch for {object_type}:{object_id}:rev{revision}",
-                {"stored": stored_ref, "computed": expected_ref},
+                {"stored": stored_integrity_ref, "computed": expected_ref},
             )
+
         return meta, payload
 
     def get_latest(self, object_type: str, object_id: str) -> tuple[CanonicalMeta, dict] | None:
@@ -146,6 +188,13 @@ class Ledger:
             return None
         return self.get_revision(object_type, object_id, rev)
 
+    # --------------------------------------------------------------- write
+
+    def _new_event_id(self, meta: CanonicalMeta) -> str:
+        """Generate event ID. Overridable in tests for failure injection."""
+        now = now_utc()
+        return f"evt:{meta.object_type}:{meta.object_id}:rev{meta.revision}:{now.timestamp()}"
+
     def write_object(
         self,
         meta: CanonicalMeta,
@@ -153,83 +202,153 @@ class Ledger:
         caller_organ: str,
         expected_revision: int,
     ) -> None:
-        """Write a new object revision with atomic event append."""
+        """Write a new object revision with atomic event append.
+
+        All checks and writes occur inside a single BEGIN IMMEDIATE transaction.
+        """
         check_owner(meta.object_type, caller_organ, meta.owner_organ)
-
-        current_rev = self.get_head_revision(meta.object_type, meta.object_id)
-
-        if expected_revision != current_rev:
-            raise RevisionConflict(
-                f"expected_revision={expected_revision} but current={current_rev} "
-                f"for {meta.object_type}:{meta.object_id}",
-                {"expected": expected_revision, "current": current_rev},
-            )
-
-        # Verify integrity
-        meta_fields = meta.meta_fields_for_integrity()
-        expected_ref = compute_integrity_ref(meta_fields, payload)
-        if meta.integrity_ref != expected_ref:
-            raise IntegrityCheckFailed(
-                "integrity_ref does not match computed hash",
-                {"provided": meta.integrity_ref, "computed": expected_ref},
-            )
-
-        # Build event
-        now = now_utc()
-        event_id = f"evt:{meta.object_type}:{meta.object_id}:rev{meta.revision}:{now.timestamp()}"
-        event_type = f"{meta.object_type}.{'created' if meta.revision == 1 else 'revised'}"
-        payload_ref = f"sha256:{__import__('hashlib').sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()}"
-        event_integrity_fields = {
-            "event_id": event_id,
-            "event_type": event_type,
-            "aggregate_ref": f"{meta.object_type}:{meta.object_id}",
-            "aggregate_revision": meta.revision,
-            "producer_organ": meta.owner_organ,
-            "run_binding_id": meta.run_binding_id,
-            "task_run_id": meta.task_run_id,
-            "correlation_id": meta.correlation_id,
-            "causation_ref": meta.causation_ref,
-            "occurred_at": meta.created_at.isoformat(),
-            "recorded_at": now.isoformat(),
-            "payload_ref": payload_ref,
-        }
-        event_integrity = compute_integrity_ref(event_integrity_fields, {})
 
         try:
             cur = self.conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
 
-            # Insert object revision
+            # ---- read current head INSIDE transaction ----
             cur.execute(
-                "INSERT INTO object_revisions (object_type, object_id, revision, meta_json, payload_json, integrity_ref) "
+                "SELECT current_revision FROM object_heads WHERE object_type=? AND object_id=?",
+                (meta.object_type, meta.object_id),
+            )
+            head_row = cur.fetchone()
+            current_rev = head_row[0] if head_row else 0
+
+            # ---- revision check ----
+            if expected_revision != current_rev:
+                self.conn.rollback()
+                raise RevisionConflict(
+                    f"expected_revision={expected_revision} but current={current_rev} "
+                    f"for {meta.object_type}:{meta.object_id}",
+                    {"expected": expected_revision, "current": current_rev},
+                )
+
+            # ---- exact next revision ----
+            if meta.revision != current_rev + 1:
+                self.conn.rollback()
+                raise RevisionConflict(
+                    f"revision must be {current_rev + 1}, got {meta.revision}",
+                    {"expected": current_rev + 1, "got": meta.revision},
+                )
+
+            # ---- supersedes_ref ----
+            if current_rev == 0:
+                if meta.supersedes_ref is not None:
+                    self.conn.rollback()
+                    raise ContractInvalid(
+                        "supersedes_ref must be None for initial creation",
+                        {"supersedes_ref": meta.supersedes_ref},
+                    )
+            else:
+                expected_supersedes = f"{meta.object_type}:{meta.object_id}:rev{current_rev}"
+                if meta.supersedes_ref != expected_supersedes:
+                    self.conn.rollback()
+                    raise ContractInvalid(
+                        f"supersedes_ref must be {expected_supersedes}",
+                        {"expected": expected_supersedes, "got": meta.supersedes_ref},
+                    )
+
+            # ---- binding stability (revision > 1) ----
+            if current_rev > 0:
+                cur.execute(
+                    "SELECT meta_json FROM object_revisions "
+                    "WHERE object_type=? AND object_id=? AND revision=?",
+                    (meta.object_type, meta.object_id, current_rev),
+                )
+                prev_row = cur.fetchone()
+                if prev_row is None:
+                    self.conn.rollback()
+                    raise LedgerWriteFailed(
+                        f"Previous revision {current_rev} not found for "
+                        f"{meta.object_type}:{meta.object_id}",
+                    )
+                prev_meta = json.loads(prev_row[0])
+                new_meta = meta.to_dict()
+                for field in _STABLE_FIELDS:
+                    if prev_meta.get(field) != new_meta.get(field):
+                        self.conn.rollback()
+                        raise BindingMismatch(
+                            f"Stable field '{field}' changed between revisions",
+                            {
+                                "field": field,
+                                "previous": prev_meta.get(field),
+                                "new": new_meta.get(field),
+                            },
+                        )
+
+            # ---- integrity ----
+            meta_fields = meta.meta_fields_for_integrity()
+            expected_ref = compute_integrity_ref(meta_fields, payload)
+            if meta.integrity_ref != expected_ref:
+                self.conn.rollback()
+                raise IntegrityCheckFailed(
+                    "integrity_ref does not match computed hash",
+                    {"provided": meta.integrity_ref, "computed": expected_ref},
+                )
+
+            # ---- canonical JSON ----
+            meta_json = canonical_json_dumps(meta.to_dict())
+            payload_json = canonical_json_dumps(payload)
+
+            # ---- insert object revision ----
+            cur.execute(
+                "INSERT INTO object_revisions "
+                "(object_type, object_id, revision, meta_json, payload_json, integrity_ref) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    meta.object_type,
-                    meta.object_id,
-                    meta.revision,
-                    json.dumps(meta.to_dict(), sort_keys=True),
-                    json.dumps(payload, sort_keys=True),
-                    meta.integrity_ref,
-                ),
+                (meta.object_type, meta.object_id, meta.revision,
+                 meta_json, payload_json, meta.integrity_ref),
             )
 
-            # Update or insert head
+            # ---- update head ----
             cur.execute(
-                "INSERT INTO object_heads (object_type, object_id, current_revision) VALUES (?, ?, ?) "
-                "ON CONFLICT(object_type, object_id) DO UPDATE SET current_revision=excluded.current_revision",
+                "INSERT INTO object_heads (object_type, object_id, current_revision) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(object_type, object_id) "
+                "DO UPDATE SET current_revision=excluded.current_revision",
                 (meta.object_type, meta.object_id, meta.revision),
             )
 
-            # Insert event
+            # ---- sequence inside transaction ----
+            cur.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM event_envelopes")
+            next_seq = cur.fetchone()[0]
+
+            # ---- build event ----
+            now = now_utc()
+            event_id = self._new_event_id(meta)
+            event_type = f"{meta.object_type}.{'created' if meta.revision == 1 else 'revised'}"
+            payload_ref = f"sha256:{__import__('hashlib').sha256(canonical_json_dumps(payload).encode('utf-8')).hexdigest()}"
+
+            event_integrity_fields = {
+                "event_id": event_id,
+                "event_type": event_type,
+                "sequence": next_seq,
+                "aggregate_ref": f"{meta.object_type}:{meta.object_id}",
+                "aggregate_revision": meta.revision,
+                "producer_organ": meta.owner_organ,
+                "run_binding_id": meta.run_binding_id,
+                "task_run_id": meta.task_run_id,
+                "correlation_id": meta.correlation_id,
+                "causation_ref": meta.causation_ref,
+                "occurred_at": meta.created_at.isoformat(),
+                "recorded_at": now.isoformat(),
+                "payload_ref": payload_ref,
+            }
+            event_integrity = compute_integrity_ref(event_integrity_fields, {})
+
             cur.execute(
                 "INSERT INTO event_envelopes "
-                "(event_id, event_type, aggregate_ref, aggregate_revision, producer_organ, "
-                "run_binding_id, task_run_id, correlation_id, causation_ref, "
-                "occurred_at, recorded_at, payload_ref, integrity_ref) "
+                "(event_id, event_type, aggregate_ref, aggregate_revision, "
+                "producer_organ, run_binding_id, task_run_id, correlation_id, "
+                "causation_ref, occurred_at, recorded_at, payload_ref, integrity_ref) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    event_id,
-                    event_type,
+                    event_id, event_type,
                     f"{meta.object_type}:{meta.object_id}",
                     meta.revision,
                     meta.owner_organ,
@@ -245,9 +364,25 @@ class Ledger:
             )
 
             cur.execute("COMMIT")
-        except Exception:
+
+        except sqlite3.IntegrityError as exc:
             self.conn.rollback()
+            raise LedgerWriteFailed(
+                "SQLite integrity constraint violated during write",
+                {"sqlite_error": str(exc)},
+            ) from exc
+        except (RevisionConflict, ContractInvalid, BindingMismatch,
+                IntegrityCheckFailed, AuthorityViolation):
+            # Already rolled back above; re-raise as-is
             raise
+        except Exception as exc:
+            self.conn.rollback()
+            raise LedgerWriteFailed(
+                f"Unexpected error during ledger write: {type(exc).__name__}",
+                {"error": str(exc)},
+            ) from exc
+
+    # --------------------------------------------------------------- events
 
     def get_events(self, run_binding_id: str) -> list[dict[str, Any]]:
         cur = self.conn.execute(
@@ -257,6 +392,43 @@ class Ledger:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def get_last_sequence(self) -> int:
-        cur = self.conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM event_envelopes")
+    def get_verified_events(self, run_binding_id: str) -> list[dict[str, Any]]:
+        """Read events for a RunBinding and recompute integrity for each."""
+        events = self.get_events(run_binding_id)
+        for evt in events:
+            integrity_fields = {
+                "event_id": evt["event_id"],
+                "event_type": evt["event_type"],
+                "sequence": evt["sequence"],
+                "aggregate_ref": evt["aggregate_ref"],
+                "aggregate_revision": evt["aggregate_revision"],
+                "producer_organ": evt["producer_organ"],
+                "run_binding_id": evt["run_binding_id"],
+                "task_run_id": evt["task_run_id"],
+                "correlation_id": evt["correlation_id"],
+                "causation_ref": evt["causation_ref"],
+                "occurred_at": evt["occurred_at"],
+                "recorded_at": evt["recorded_at"],
+                "payload_ref": evt["payload_ref"],
+            }
+            expected_ref = compute_integrity_ref(integrity_fields, {})
+            if evt["integrity_ref"] != expected_ref:
+                raise IntegrityCheckFailed(
+                    "Event integrity check failed",
+                    {
+                        "event_id": evt["event_id"],
+                        "stored": evt["integrity_ref"],
+                        "computed": expected_ref,
+                    },
+                )
+        return events
+
+    def get_last_sequence(self, run_binding_id: str | None = None) -> int:
+        if run_binding_id is not None:
+            cur = self.conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM event_envelopes WHERE run_binding_id=?",
+                (run_binding_id,),
+            )
+        else:
+            cur = self.conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM event_envelopes")
         return cur.fetchone()[0]

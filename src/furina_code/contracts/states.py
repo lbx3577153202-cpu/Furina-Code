@@ -66,9 +66,11 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("observe", "waiting_user"): {("observe", "active")},
     ("observe", "external_blocked"): {("observe", "active")},
     ("observe", "paused"): {("observe", "active")},
-    # From deliberate/active
+    # From deliberate/active (P4 back edges: deliberate→observe, deliberate→verify)
     ("deliberate", "active"): {
+        ("observe", "active"),
         ("authorize", "active"),
+        ("verify", "active"),
         ("deliberate", "waiting_user"),
         ("deliberate", "external_blocked"),
         ("deliberate", "paused"),
@@ -76,8 +78,9 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("deliberate", "waiting_user"): {("deliberate", "active")},
     ("deliberate", "external_blocked"): {("deliberate", "active")},
     ("deliberate", "paused"): {("deliberate", "active")},
-    # From authorize/active
+    # From authorize/active (P4 back edge: authorize→deliberate)
     ("authorize", "active"): {
+        ("deliberate", "active"),
         ("act", "active"),
         ("authorize", "waiting_user"),
         ("authorize", "external_blocked"),
@@ -86,7 +89,7 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("authorize", "waiting_user"): {("authorize", "active")},
     ("authorize", "external_blocked"): {("authorize", "active")},
     ("authorize", "paused"): {("authorize", "active")},
-    # From act/active
+    # From act/active (act→reconcile preserved)
     ("act", "active"): {
         ("reconcile", "active"),
         ("act", "waiting_user"),
@@ -96,8 +99,9 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("act", "waiting_user"): {("act", "active")},
     ("act", "external_blocked"): {("act", "active")},
     ("act", "paused"): {("act", "active")},
-    # From reconcile/active
+    # From reconcile/active (P4 back edge: reconcile→deliberate)
     ("reconcile", "active"): {
+        ("deliberate", "active"),
         ("verify", "active"),
         ("reconcile", "waiting_user"),
         ("reconcile", "external_blocked"),
@@ -106,8 +110,9 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("reconcile", "waiting_user"): {("reconcile", "active")},
     ("reconcile", "external_blocked"): {("reconcile", "active")},
     ("reconcile", "paused"): {("reconcile", "active")},
-    # From verify/active
+    # From verify/active (P4 back edge: verify→deliberate, verify→adjudicate preserved)
     ("verify", "active"): {
+        ("deliberate", "active"),
         ("adjudicate", "active"),
         ("verify", "waiting_user"),
         ("verify", "external_blocked"),
@@ -116,8 +121,9 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("verify", "waiting_user"): {("verify", "active")},
     ("verify", "external_blocked"): {("verify", "active")},
     ("verify", "paused"): {("verify", "active")},
-    # From adjudicate/active
+    # From adjudicate/active (P4 back edge: adjudicate→deliberate)
     ("adjudicate", "active"): {
+        ("deliberate", "active"),
         ("terminal", "terminal"),
         ("adjudicate", "waiting_user"),
         ("adjudicate", "external_blocked"),
@@ -126,15 +132,8 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("adjudicate", "waiting_user"): {("adjudicate", "active")},
     ("adjudicate", "external_blocked"): {("adjudicate", "active")},
     ("adjudicate", "paused"): {("adjudicate", "active")},
-    # Recovery transitions
-    ("intake", "recovery_review"): {("intake", "active")},
-    ("observe", "recovery_review"): {("observe", "active")},
-    ("deliberate", "recovery_review"): {("deliberate", "active")},
-    ("authorize", "recovery_review"): {("authorize", "active")},
-    ("act", "recovery_review"): {("act", "active")},
-    ("reconcile", "recovery_review"): {("reconcile", "active")},
-    ("verify", "recovery_review"): {("verify", "active")},
-    ("adjudicate", "recovery_review"): {("adjudicate", "active")},
+    # Recovery transitions — REJECTED in E3 (no RecoveryVerdict object exists).
+    # E6 will re-add when RecoveryVerdict is implemented.
     # Manual intervention — no automatic return
     ("intake", "manual_intervention"): set(),
     ("observe", "manual_intervention"): set(),

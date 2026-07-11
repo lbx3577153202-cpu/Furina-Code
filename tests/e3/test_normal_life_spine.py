@@ -54,8 +54,7 @@ class TestNormalLifeSpine:
         }, caller_organ="I2-D", expected_revision=0)
 
         # 4. TaskRun rev 2: observe/active
-        tr2 = tr.transition("I2-D", "rb-1", "t-1", "tr-1", "proj-1", "corr-1",
-                           Phase.OBSERVE, Disposition.ACTIVE)
+        tr2 = tr.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
         ledger.write_object(tr2.meta, {
             "task_revision": tr2.task_revision, "phase": tr2.phase.value,
             "disposition": tr2.disposition.value, "current_refs": [],

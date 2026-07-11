@@ -10,9 +10,9 @@ from .errors import (
     IntegrityCheckFailed,
     LedgerWriteFailed,
 )
-from .meta import CanonicalMeta, SCHEMA_VERSION, now_utc, compute_integrity_ref
+from .meta import CanonicalMeta, SCHEMA_VERSION, now_utc, compute_integrity_ref, canonical_json_dumps
 from .objects import RunBinding, TaskDossier, TaskRun, Checkpoint, OWNER_MAP, check_owner
-from .states import Phase, Disposition, RunBindingStatus, TaskDossierStatus
+from .states import Phase, Disposition, RunBindingStatus, TaskDossierStatus, is_valid_transition
 
 __all__ = [
     "FurinaContractError",
@@ -27,6 +27,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "now_utc",
     "compute_integrity_ref",
+    "canonical_json_dumps",
     "RunBinding",
     "TaskDossier",
     "TaskRun",
@@ -37,4 +38,5 @@ __all__ = [
     "Disposition",
     "RunBindingStatus",
     "TaskDossierStatus",
+    "is_valid_transition",
 ]

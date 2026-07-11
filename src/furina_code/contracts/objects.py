@@ -17,6 +17,7 @@ from .states import (
 from .errors import (
     ContractInvalid,
     AuthorityViolation,
+    BindingMismatch,
     RevisionConflict,
     StateTransitionInvalid,
 )
@@ -325,13 +326,10 @@ class TaskRun:
     def transition(
         self,
         caller_organ: str,
-        run_binding_id: str,
-        task_id: str,
-        task_run_id: str,
-        project_ref: str,
-        correlation_id: str,
         new_phase: Phase,
         new_disposition: Disposition,
+        correlation_id: str | None = None,
+        recovery_verdict_ref: str | None = None,
     ) -> TaskRun:
         check_owner("TaskRun", caller_organ, self.meta.owner_organ)
 
@@ -352,6 +350,8 @@ class TaskRun:
 
         now = now_utc()
         new_rev = self.meta.revision + 1
+        corr = correlation_id or self.meta.correlation_id
+        supersedes_ref = f"TaskRun:{self.meta.object_id}:rev{self.meta.revision}"
         payload = {
             "task_revision": self.task_revision,
             "phase": new_phase.value,
@@ -363,39 +363,39 @@ class TaskRun:
         }
         meta_fields = {
             "schema_version": SCHEMA_VERSION,
-            "object_type": "TaskRun",
-            "object_id": task_run_id,
+            "object_type": self.meta.object_type,
+            "object_id": self.meta.object_id,
             "revision": new_rev,
-            "owner_organ": OWNER_MAP["TaskRun"],
-            "run_binding_id": run_binding_id,
-            "task_id": task_id,
-            "task_run_id": task_run_id,
-            "project_ref": project_ref,
-            "correlation_id": correlation_id,
-            "causation_ref": f"TaskRun:{task_run_id}:rev{self.meta.revision}",
+            "owner_organ": self.meta.owner_organ,
+            "run_binding_id": self.meta.run_binding_id,
+            "task_id": self.meta.task_id,
+            "task_run_id": self.meta.task_run_id,
+            "project_ref": self.meta.project_ref,
+            "correlation_id": corr,
+            "causation_ref": supersedes_ref,
             "created_at": now.isoformat(),
             "recorded_at": now.isoformat(),
             "classification": "project_internal",
-            "supersedes_ref": f"TaskRun:{task_run_id}:rev{self.meta.revision}",
+            "supersedes_ref": supersedes_ref,
         }
         integrity = compute_integrity_ref(meta_fields, payload)
         meta = CanonicalMeta(
             schema_version=SCHEMA_VERSION,
-            object_type="TaskRun",
-            object_id=task_run_id,
+            object_type=self.meta.object_type,
+            object_id=self.meta.object_id,
             revision=new_rev,
-            owner_organ=OWNER_MAP["TaskRun"],
-            run_binding_id=run_binding_id,
-            task_id=task_id,
-            task_run_id=task_run_id,
-            project_ref=project_ref,
-            correlation_id=correlation_id,
-            causation_ref=f"TaskRun:{task_run_id}:rev{self.meta.revision}",
+            owner_organ=self.meta.owner_organ,
+            run_binding_id=self.meta.run_binding_id,
+            task_id=self.meta.task_id,
+            task_run_id=self.meta.task_run_id,
+            project_ref=self.meta.project_ref,
+            correlation_id=corr,
+            causation_ref=supersedes_ref,
             created_at=now,
             recorded_at=now,
             classification="project_internal",
             integrity_ref=integrity,
-            supersedes_ref=f"TaskRun:{task_run_id}:rev{self.meta.revision}",
+            supersedes_ref=supersedes_ref,
         )
         return TaskRun(
             meta=meta,

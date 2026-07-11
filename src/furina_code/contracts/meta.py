@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .errors import ContractInvalid
+
 CLASSIFICATION_PUBLIC = "public"
 CLASSIFICATION_PROJECT_INTERNAL = "project_internal"
 CLASSIFICATION_SENSITIVE = "sensitive"
@@ -26,10 +28,31 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def canonical_json_dumps(obj: Any) -> str:
+    """Canonical JSON serialization for integrity computation and storage.
+
+    Rules: UTF-8, sort_keys=True, ensure_ascii=False, compact separators,
+    allow_nan=False.  Rejects non-serializable objects and NaN/Infinity.
+    """
+    try:
+        return json.dumps(
+            obj,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except ValueError:
+        raise ContractInvalid(
+            "Value not JSON-serializable or contains NaN/Infinity",
+            {"value_type": type(obj).__name__},
+        )
+
+
 def compute_integrity_ref(meta_fields: dict[str, Any], payload: dict[str, Any]) -> str:
     """Compute sha256:<hex> over CanonicalMeta fields (excluding integrity_ref) + payload."""
     combined = {"meta": meta_fields, "payload": payload}
-    raw = json.dumps(combined, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    raw = canonical_json_dumps(combined).encode("utf-8")
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
 
 
@@ -54,17 +77,21 @@ class CanonicalMeta:
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
-            raise ValueError(f"Unknown schema_version: {self.schema_version}")
+            raise ContractInvalid(f"Unknown schema_version: {self.schema_version}")
         if self.revision < 1:
-            raise ValueError(f"revision must be >= 1, got {self.revision}")
+            raise ContractInvalid(f"revision must be >= 1, got {self.revision}")
         if self.classification not in VALID_CLASSIFICATIONS:
-            raise ValueError(f"Invalid classification: {self.classification}")
+            raise ContractInvalid(f"Invalid classification: {self.classification}")
         if self.revision > 1 and not self.supersedes_ref:
-            raise ValueError("supersedes_ref required when revision > 1")
+            raise ContractInvalid("supersedes_ref required when revision > 1")
         if self.revision == 1 and self.supersedes_ref is not None:
-            raise ValueError("supersedes_ref must be None when revision == 1")
+            raise ContractInvalid("supersedes_ref must be None when revision == 1")
         if not self.integrity_ref.startswith("sha256:") or len(self.integrity_ref) != 71:
-            raise ValueError(f"Invalid integrity_ref format: {self.integrity_ref}")
+            raise ContractInvalid(f"Invalid integrity_ref format: {self.integrity_ref}")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() != timezone.utc.utcoffset(None):
+            raise ContractInvalid("created_at must be timezone-aware UTC")
+        if self.recorded_at.tzinfo is None or self.recorded_at.utcoffset() != timezone.utc.utcoffset(None):
+            raise ContractInvalid("recorded_at must be timezone-aware UTC")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict (timestamps as ISO strings)."""
