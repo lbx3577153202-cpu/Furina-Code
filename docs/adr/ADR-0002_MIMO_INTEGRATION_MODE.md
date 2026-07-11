@@ -1,20 +1,18 @@
 # ADR-0002: MiMo Integration Mode
 
 **Date:** 2026-07-12
-**Stage:** MC0
-**Status:** Candidate — activates only after PR merge
+**Stage:** MC0 → MC1
+**Status:** Accepted
 
 ---
 
 ## 1. Decision
 
-**Selected Mode: A — Stable CLI Transport Candidate**
+**Selected Mode: A — Stable CLI Transport**
 
-MiMo Code CLI is the selected integration transport candidate.
+MiMo Code CLI is the selected integration transport.
 
-It is not yet approved to run against the real repository.
-It is not yet proven read-only.
-It is not yet proven directory-contained.
+ADR acceptance activates the MC1 contract design phase. It does NOT grant real repository access. Real repository access requires separate approval after MC1 sandbox proof.
 
 ---
 
@@ -66,6 +64,7 @@ Mode A does NOT mean:
 - Production-grade directory isolation
 - Read-only tool restriction
 - Reliable pure JSON output
+- Real repository access approved
 
 ---
 
@@ -106,14 +105,16 @@ This decision does not rely on direct API availability.
 
 ## 7. MC1 Scope (Not E5)
 
-MC1 will design:
+MC1 designs:
 
 1. **BackendPort** contract
 2. **FileBackend** adaptation
-3. **MiMoCodeCLIAdapter** contract and sandbox boundary design
-4. **Output template** for reliable JSON candidate generation
+3. **MiMoCodeCLIAdapter** contract and sandbox boundary
+4. **Strict exact-JSON output protocol** (no heuristic extraction)
 5. **Timeout wrapper** for process management
-6. **Output parser** to extract JSON from potential extra text
+6. **14 TransportResult status collection** (including sandbox_violation)
+7. **Candidate source rule**: stdout.bin is raw evidence, candidate.json is Furina-generated
+8. **Provider state isolation**: config/session/credential isolation must be probed before automation
 
 MC1 does NOT implement E5 features:
 - Project-action Authorization Gate
@@ -123,7 +124,23 @@ MC1 does NOT implement E5 features:
 
 ---
 
-## 8. MC1 Sandbox Requirements
+## 8. Strict JSON Protocol (MC1 Correction)
+
+Previous wording: "extract JSON from potential extra text"
+
+Corrected: The adapter output MUST be exact JSON. No heuristic extraction.
+
+All of the following are protocol failures:
+- Explanatory text before/after JSON
+- Markdown code fences
+- Multiple JSON objects
+- Heuristic regex extraction
+
+Future controlled correction requests may be designed, but MC1 must not silently sanitize model output.
+
+---
+
+## 9. MC1 Sandbox Requirements
 
 MC1 does NOT allow MiMo CLI to use real repository root as writable working directory.
 
@@ -131,10 +148,12 @@ First automated invocation must use:
 
 ```
 runtime_root/
-└─ mimo-invocation/
-   ├─ context_packet.json
-   ├─ instruction.txt
-   └─ output/
+└─ backend/
+   └─ <run-binding-id>/
+      └─ <invocation-id>/
+         ├─ request/
+         ├─ output/
+         └─ evidence/
 ```
 
 This directory must be outside the real repository root.
@@ -149,15 +168,9 @@ Before the following capabilities are proven:
 
 MiMo CLI must NOT directly open the real repository.
 
-When code context is needed, use:
-- Controlled file copies
-- Or detached disposable worktrees
-
-Never use the real main working directory.
-
 ---
 
-## 9. Legacy Contamination Isolation
+## 10. Legacy Contamination Isolation
 
 MC1 must enforce:
 
@@ -169,11 +182,9 @@ MC1 must enforce:
 - cwd must be explicitly set to runtime/sandbox
 - Context must only come from current ContextEnvelope
 
-Legacy trusted workspaces may remain in MiMo local config, but Furina Code must not depend on or access them.
-
 ---
 
-## 10. Command Design Not Frozen
+## 11. Command Design Not Frozen
 
 The following are NOT yet verified and must NOT be hardcoded:
 
@@ -193,7 +204,7 @@ Unknown flag behavior must fail-closed.
 
 ---
 
-## 11. Constraints
+## 12. Constraints
 
 - MiMo is an external backend, not part of Furina Code core
 - MiMo sessions are not long-term memory
@@ -204,7 +215,7 @@ Unknown flag behavior must fail-closed.
 
 ---
 
-## 12. Things Not to Implement
+## 13. Things Not to Implement
 
 - Direct MiMo API adapter (use CLI instead)
 - MiMo session as persistent memory
