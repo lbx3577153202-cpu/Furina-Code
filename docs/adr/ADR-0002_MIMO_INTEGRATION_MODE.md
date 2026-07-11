@@ -20,7 +20,10 @@ It is not yet proven directory-contained.
 
 ## 2. Context
 
-Furina Code needs to determine how MiMo Code can serve as an external backend for the read-only inspection loop. The investigation tested the real MiMo Code CLI, API, and file bridge compatibility.
+Furina Code needs to determine how MiMo Code can serve as an external backend for the read-only inspection loop. The investigation tested the real MiMo Code CLI and performed a minimal file-based probe.
+
+CLI provider credentials and visible models were observed.
+Direct MiMo API access and protocol compatibility were not tested.
 
 ---
 
@@ -40,10 +43,11 @@ Furina Code needs to determine how MiMo Code can serve as an external backend fo
 - Duration: ~10 seconds
 - Probe ran outside repository
 
-### API Availability
+### CLI Provider Observation
 - Xiaomi API credential configured via CLI provider
-- Models available: mimo-auto, mimo-v2.5, mimo-v2.5-pro, mimo-v2.5-pro-ultraspeed
-- Direct API access not tested
+- Models visible: mimo-auto, mimo-v2.5, mimo-v2.5-pro, mimo-v2.5-pro-ultraspeed
+- Direct API access: **untested**
+- Protocol compatibility: **untested**
 
 ---
 
@@ -65,21 +69,22 @@ Mode A does NOT mean:
 
 ---
 
-## 5. Rejected Modes
+## 5. Alternative Modes Considered
 
-### Mode B: API Available
-- Not rejected, but CLI is preferred because:
-  - CLI already provides file access and tool execution
-  - CLI handles authentication automatically
-  - CLI provides session management
-  - API would require separate authentication setup
+### Mode B — Direct API Adapter
+Deferred, not rejected.
 
-### Mode C: Manual File Bridge Only
-- Rejected because CLI provides non-interactive execution
-- Manual bridge is unnecessary when CLI can run autonomously
+Direct API access, base URL, protocol compatibility, error semantics, and credential handling were not tested in MC0.
+It may be reconsidered after the CLI route is evaluated.
 
-### Mode D: Connection Blocked
-- Rejected — CLI works and API is accessible
+### Mode C — Manual File Bridge Only
+Rejected because CLI provides non-interactive execution.
+Manual bridge is unnecessary when CLI can run autonomously.
+
+### Mode D — Connection Blocked
+Rejected because the non-interactive MiMo Code CLI transport was successfully executed in an external temporary directory.
+
+This decision does not rely on direct API availability.
 
 ---
 
