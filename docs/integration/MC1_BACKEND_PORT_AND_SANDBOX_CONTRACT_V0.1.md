@@ -64,18 +64,30 @@ These are plain, immutable DTOs. They are NOT added to OWNER_MAP.
 ```python
 @dataclass(frozen=True)
 class BackendProbeRequest:
-    executable_path: str
+    executable_ref: str  # logical name, config ref, or canonical ref — never absolute path
     probe_timeout_seconds: int
 
 @dataclass(frozen=True)
 class BackendProbeResult:
     available: bool
     version: str | None
-    executable_path: str
+    executable_ref: str  # logical name, config ref, or canonical ref — never absolute path
     supported_flags: tuple[str, ...]
     model_ids: tuple[str, ...]
-    errors: tuple[str, ...]
+    errors: tuple[str, ...]  # sanitized, no user paths
 ```
+
+`executable_ref` values (examples):
+- `command:mimo`
+- `backend-executable:mimo-code`
+- `config-ref:mimo-cli-default`
+
+The resolved absolute executable path exists ONLY in the瞬时 runtime context during process launch. It must NOT be:
+- Serialized into DTOs
+- Written to logs
+- Written to Ledger
+- Written to invocation summary
+- Included in exception messages
 
 ### 3.2 Invocation Request
 
@@ -173,7 +185,8 @@ class SandboxFileEntry:
     sha256: str | None
     is_symlink: bool
     is_junction_or_reparse_point: bool
-    resolved_target: str | None  # must stay within sandbox
+    resolved_target_ref: str | None  # relative ref, not absolute
+    resolved_target_scope: str  # "inside_sandbox" | "outside_sandbox" | "unresolved" | "not_applicable"
 
 @dataclass(frozen=True)
 class SandboxManifest:
@@ -184,6 +197,11 @@ class SandboxManifest:
     entries: tuple[SandboxFileEntry, ...]
     manifest_digest: str  # canonical SHA-256 of sorted entries
 ```
+
+When a link target escapes the sandbox:
+- `resolved_target_scope = "outside_sandbox"`
+- `transport_status = "sandbox_violation"`
+- The real absolute escape path must NOT be written to manifest
 
 Each manifest captures ONE observation point. Two separate instances are created:
 
@@ -483,7 +501,46 @@ May record:
 - config existence
 - authentication failure category
 
-### 8.3 Bounded I/O
+### 8.3 Error Field Redaction
+
+`BackendProbeResult.errors` and `BackendTransportResult.error_detail` must be sanitized:
+
+- Must NOT contain user absolute paths
+- Must NOT contain credential paths
+- Must NOT contain environment variable values
+- Must NOT contain tokens or cookies
+
+Prefer stable `error_code` values:
+- `executable_not_found`
+- `sandbox_escape`
+- `provider_state_isolation_failed`
+- `authentication_failed`
+- `timeout`
+- `protocol_error`
+
+`error_detail` may contain sanitized context but must be path- and credential-free.
+
+### 8.4 Unified Path Reference Rule
+
+All serializable DTOs, manifests, transport evidence, and error content may ONLY store:
+
+- Logical references (`command:mimo`, `backend-executable:mimo-code`)
+- Relative references (`context_packet.json`, `stdout.bin`)
+- Canonical refs without user-identity information
+
+Absolute paths are ONLY allowed in瞬时, non-serialized local runtime context during process launch.
+
+This applies to:
+- executable
+- cwd
+- sandbox
+- stdout / stderr
+- candidate
+- manifest
+- resolved link targets
+- config / data / session roots
+
+### 8.5 Bounded I/O
 
 | Resource | Limit |
 |---|---|
@@ -500,7 +557,7 @@ If either stream exceeds hard limit:
 - Save truncated evidence
 - Prohibit further candidate parsing
 
-### 8.4 Process Tree Termination
+### 8.6 Process Tree Termination
 
 On timeout:
 - Kill the entire child process tree
@@ -652,6 +709,12 @@ MC1 implementation must pass at minimum:
 | Adapter method parameter contains Ledger | type error |
 | Transport DTO contains env value field | structurally absent |
 | Transport DTO contains absolute user path | structurally absent |
+| Probe DTO contains executable absolute path | structurally absent (executable_ref only) |
+| SandboxManifest contains absolute resolved target | structurally absent (resolved_target_ref only) |
+| Probe errors contain user absolute path | sanitized |
+| Transport error_detail contains user absolute path | sanitized |
+| Outside-sandbox target persists only logical scope | verified (resolved_target_scope) |
+| Resolved executable path is runtime-only and non-serializable | verified |
 | Real repository as cwd rejected | sandbox_violation |
 | Runtime inside repository rejected | sandbox_violation |
 | Legacy repository path rejected | sandbox_violation |
