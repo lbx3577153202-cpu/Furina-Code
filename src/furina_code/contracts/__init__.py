@@ -9,9 +9,15 @@ from .errors import (
     StateTransitionInvalid,
     IntegrityCheckFailed,
     LedgerWriteFailed,
+    IdempotencyConflict,
 )
 from .meta import CanonicalMeta, SCHEMA_VERSION, now_utc, compute_integrity_ref, canonical_json_dumps
-from .objects import RunBinding, TaskDossier, TaskRun, Checkpoint, OWNER_MAP, check_owner
+from .objects import (
+    RunBinding, TaskDossier, TaskRun, Checkpoint,
+    BackendProfile, ContextEnvelope, CandidateEnvelope, ProjectSnapshot,
+    EvidenceEnvelope, VerificationPlan, VerificationVerdict, CompletionVerdict,
+    OWNER_MAP, check_owner,
+)
 from .states import Phase, Disposition, RunBindingStatus, TaskDossierStatus, is_valid_transition
 
 __all__ = [
@@ -23,6 +29,7 @@ __all__ = [
     "StateTransitionInvalid",
     "IntegrityCheckFailed",
     "LedgerWriteFailed",
+    "IdempotencyConflict",
     "CanonicalMeta",
     "SCHEMA_VERSION",
     "now_utc",
@@ -32,6 +39,14 @@ __all__ = [
     "TaskDossier",
     "TaskRun",
     "Checkpoint",
+    "BackendProfile",
+    "ContextEnvelope",
+    "CandidateEnvelope",
+    "ProjectSnapshot",
+    "EvidenceEnvelope",
+    "VerificationPlan",
+    "VerificationVerdict",
+    "CompletionVerdict",
     "OWNER_MAP",
     "check_owner",
     "Phase",
