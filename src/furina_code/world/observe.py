@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 MAX_FILE_BYTES = 1_000_000  # 1 MB
+
+
+@dataclass(frozen=True)
+class SafeFileObservation:
+    """Structured result for safe file reads — replaces None-as-failure."""
+    status: str  # present | missing | symlink_rejected | escape_rejected | git_internal_rejected | oversized | decode_failed | parse_failed
+    sha256: str | None = None
+    content: str | None = None
+    size_bytes: int | None = None
+    reason: str | None = None
 
 
 def _safe_resolve_check(path: Path, repo_root: Path) -> Path:
@@ -23,58 +34,94 @@ def _safe_resolve_check(path: Path, repo_root: Path) -> Path:
     return resolved
 
 
-def _safe_read(path: Path, repo_root: Path, max_bytes: int = MAX_FILE_BYTES) -> str | None:
-    """Read a file with symlink/size/root checks. Returns None if missing."""
+def safe_observe_file(path: Path, repo_root: Path, max_bytes: int = MAX_FILE_BYTES) -> SafeFileObservation:
+    """Read a file with structured status reporting."""
+    # Symlink check first (before resolve)
+    if path.is_symlink():
+        return SafeFileObservation(status="symlink_rejected", reason=f"Path is a symlink: {path}")
+
+    resolved = path.resolve()
+
+    # Escape check
     try:
-        resolved = _safe_resolve_check(path, repo_root)
+        resolved.relative_to(repo_root)
     except ValueError:
-        return None
+        return SafeFileObservation(status="escape_rejected", reason=f"Path escapes repository root: {path}")
+
+    # .git internal check
+    if ".git" in resolved.parts:
+        return SafeFileObservation(status="git_internal_rejected", reason=f"Path is inside .git: {path}")
+
+    # Missing check
     if not resolved.is_file():
-        return None
-    if resolved.stat().st_size > max_bytes:
-        return None
-    return resolved.read_text(encoding="utf-8", errors="replace")
+        return SafeFileObservation(status="missing", reason=f"File not found: {path}")
+
+    # Size check
+    size = resolved.stat().st_size
+    if size > max_bytes:
+        sha = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+        return SafeFileObservation(
+            status="oversized", sha256=sha, size_bytes=size,
+            reason=f"File too large: {size} bytes (max {max_bytes})",
+        )
+
+    # Read
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return SafeFileObservation(
+            status="decode_failed", size_bytes=size,
+            reason=f"Decode failed: {type(exc).__name__}: {exc}",
+        )
+
+    sha = "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+    return SafeFileObservation(status="present", sha256=sha, content=content, size_bytes=size)
+
+
+def _safe_read(path: Path, repo_root: Path, max_bytes: int = MAX_FILE_BYTES) -> str | None:
+    """Read a file with symlink/size/root checks. Returns None if missing or rejected."""
+    obs = safe_observe_file(path, repo_root, max_bytes)
+    return obs.content if obs.status == "present" else None
 
 
 def _safe_sha256(path: Path, repo_root: Path) -> str | None:
     """Compute SHA-256 with symlink/size/root checks."""
-    try:
-        resolved = _safe_resolve_check(path, repo_root)
-    except ValueError:
-        return None
-    if not resolved.is_file():
-        return None
-    if resolved.stat().st_size > MAX_FILE_BYTES:
-        return None
-    return "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+    obs = safe_observe_file(path, repo_root)
+    return obs.sha256 if obs.status == "present" else None
 
 
-def observe_project(workspace: str) -> dict[str, Any]:
+def observe_project(workspace: str, repository_root: str | None = None) -> dict[str, Any]:
     """Observe project metadata from a workspace directory.
+
+    Uses repository_root (from observe_git) as the canonical root if provided,
+    otherwise resolves from workspace. This ensures all file observations use
+    the same root as git observation.
 
     Returns dict with: pyproject_exists, pyproject_sha256, requires_python,
     runtime_deps, dev_deps, pytest_testpaths, ci_config_exists, ci_config_sha256,
-    blind_spots.
+    blind_spots, file_observations.
     """
     ws = Path(workspace)
-    repo_root = ws.resolve()
+    repo_root = Path(repository_root).resolve() if repository_root else ws.resolve()
 
     blind_spots: list[str] = []
+    file_observations: dict[str, SafeFileObservation] = {}
     requires_python: str | None = None
     runtime_deps: list[str] = []
     dev_deps: list[str] = []
     pytest_testpaths: list[str] = ["tests"]
 
-    # pyproject.toml
-    pyproject_path = ws / "pyproject.toml"
-    pyproject_content = _safe_read(pyproject_path, repo_root)
-    pyproject_exists = pyproject_content is not None
-    pyproject_sha256 = _safe_sha256(pyproject_path, repo_root) if pyproject_exists else None
+    # pyproject.toml — always read from repository_root
+    pyproject_path = repo_root / "pyproject.toml"
+    pyproject_obs = safe_observe_file(pyproject_path, repo_root)
+    file_observations["pyproject.toml"] = pyproject_obs
+    pyproject_exists = pyproject_obs.status == "present"
+    pyproject_sha256 = pyproject_obs.sha256 if pyproject_exists else None
 
-    if pyproject_exists:
+    if pyproject_obs.status == "present":
         try:
             import tomllib
-            data = tomllib.loads(pyproject_content)
+            data = tomllib.loads(pyproject_obs.content)
             project = data.get("project", {})
             requires_python = project.get("requires-python")
             runtime_deps = list(project.get("dependencies", []))
@@ -87,30 +134,36 @@ def observe_project(workspace: str) -> dict[str, Any]:
                 pytest_testpaths = list(tp)
         except Exception as exc:
             blind_spots.append(f"pyproject.toml parse failed: {type(exc).__name__}: {exc}")
+            file_observations["pyproject.toml"] = SafeFileObservation(
+                status="parse_failed", sha256=pyproject_obs.sha256,
+                content=pyproject_obs.content, size_bytes=pyproject_obs.size_bytes,
+                reason=f"Parse failed: {type(exc).__name__}: {exc}",
+            )
             requires_python = None
             runtime_deps = []
             dev_deps = []
-    else:
+    elif pyproject_obs.status == "missing":
         blind_spots.append("pyproject.toml missing — cannot determine Python version or dependencies")
+    else:
+        blind_spots.append(f"pyproject.toml {pyproject_obs.status}: {pyproject_obs.reason}")
 
-    # CI config
+    # CI config — always read from repository_root
     ci_paths = [
-        ws / ".github" / "workflows" / "ci.yml",
-        ws / ".github" / "workflows" / "ci.yaml",
-        ws / ".gitlab-ci.yml",
+        repo_root / ".github" / "workflows" / "ci.yml",
+        repo_root / ".github" / "workflows" / "ci.yaml",
+        repo_root / ".gitlab-ci.yml",
     ]
     ci_config_exists = False
     ci_config_sha256 = None
     for cp in ci_paths:
-        try:
-            resolved = _safe_resolve_check(cp, repo_root)
-            if resolved.is_file():
-                ci_config_exists = True
-                ci_config_sha256 = _safe_sha256(cp, repo_root)
-                break
-        except ValueError:
-            blind_spots.append(f"CI config path rejected: {cp.name}")
-            continue
+        cp_obs = safe_observe_file(cp, repo_root)
+        file_observations[cp.name] = cp_obs
+        if cp_obs.status == "present":
+            ci_config_exists = True
+            ci_config_sha256 = cp_obs.sha256
+            break
+        elif cp_obs.status not in ("missing",):
+            blind_spots.append(f"CI config {cp.name} {cp_obs.status}: {cp_obs.reason}")
 
     if not ci_config_exists:
         blind_spots.append("no CI configuration found")
@@ -125,4 +178,5 @@ def observe_project(workspace: str) -> dict[str, Any]:
         "ci_config_exists": ci_config_exists,
         "ci_config_sha256": ci_config_sha256,
         "blind_spots": tuple(blind_spots),
+        "file_observations": file_observations,
     }

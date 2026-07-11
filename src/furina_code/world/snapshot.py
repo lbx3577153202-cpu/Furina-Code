@@ -21,13 +21,21 @@ def create_project_snapshot(
     snapshot_id: str | None = None,
     causation_ref: str | None = None,
 ) -> ProjectSnapshot:
-    """Observe workspace and create a ProjectSnapshot formal object."""
-    git_obs = observe_git(workspace)
-    proj_obs = observe_project(workspace)
+    """Observe workspace and create a ProjectSnapshot formal object.
 
-    # Merge all observations for snapshot hash
+    Uses the repository_root from observe_git as the single canonical root
+    for all file observations (pyproject, CI config, etc.).
+    """
+    git_obs = observe_git(workspace)
+    # Use the real repository root for all file observations
+    repository_root = git_obs["repository_root"]
+    proj_obs = observe_project(workspace, repository_root=repository_root)
+
+    # Merge all observations for snapshot hash (exclude file_observations — internal only)
     all_obs: dict[str, Any] = {**git_obs}
     for k, v in proj_obs.items():
+        if k == "file_observations":
+            continue  # internal structured data, not part of snapshot hash
         if isinstance(v, tuple):
             all_obs[k] = list(v)
         else:

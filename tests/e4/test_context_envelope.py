@@ -35,28 +35,57 @@ class TestContextEnvelope:
         assert ctx.backend_ref == "sha256:bp"
 
     def test_context_no_secrets(self, tmp_path):
-        repo = str(Path(__file__).resolve().parents[2])
-        snap = create_project_snapshot(
-            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
-            project_ref="p", correlation_id="c", workspace=repo,
-        )
-        dossier = TaskDossier.create(
-            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
-            project_ref="p", correlation_id="c",
-            source_intent_ref="cli:inspect",
-            structured_goal="test", success_criteria=(),
-            scope=(), exclusions=(), unknowns=(),
-            risk_class="low", user_constraints=(),
-        )
-        ctx = create_context_envelope(
-            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
-            project_ref="p", correlation_id="c",
-            snapshot=snap, dossier=dossier,
-        )
-        import json
-        payload_str = json.dumps(ctx.context_payload)
-        assert "E:\\" not in payload_str
-        assert "C:\\" not in payload_str
+        """Context packet must not leak absolute paths, tokens, or env vars."""
+        import os
+        # Inject decoy values into environment
+        decoy_token = "sk-test-decoy-token-12345"
+        decoy_env_key = "FURINA_TEST_DECOY_VAR"
+        os.environ[decoy_env_key] = decoy_token
+
+        try:
+            repo = str(Path(__file__).resolve().parents[2])
+            snap = create_project_snapshot(
+                run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+                project_ref="p", correlation_id="c", workspace=repo,
+            )
+            dossier = TaskDossier.create(
+                run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+                project_ref="p", correlation_id="c",
+                source_intent_ref="cli:inspect",
+                structured_goal="test", success_criteria=(),
+                scope=(), exclusions=(), unknowns=(),
+                risk_class="low", user_constraints=(),
+            )
+            ctx = create_context_envelope(
+                run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+                project_ref="p", correlation_id="c",
+                snapshot=snap, dossier=dossier,
+            )
+            import json
+            payload_str = json.dumps(ctx.context_payload)
+            full_str = json.dumps(ctx.__dict__, default=str)
+
+            # Absolute paths must not leak
+            assert "E:\\" not in payload_str
+            assert "C:\\" not in payload_str
+
+            # Decoy token must not leak
+            assert decoy_token not in payload_str
+            assert decoy_token not in full_str
+
+            # Decoy env key must not leak
+            assert decoy_env_key not in payload_str
+
+            # Redactions must cover expected categories
+            assert "environment_variables" in ctx.redactions
+            assert "credentials" in ctx.redactions
+            assert "absolute_workspace_path" in ctx.redactions
+
+            # classification_summary and disclosure_basis must be set
+            assert ctx.classification_summary
+            assert ctx.disclosure_basis
+        finally:
+            del os.environ[decoy_env_key]
 
     def test_write_context_packet(self, tmp_path):
         repo = str(Path(__file__).resolve().parents[2])

@@ -148,12 +148,22 @@ def _write_obj(ledger: Ledger, obj, caller_organ: str, expected_revision: int) -
     ledger.write_object(obj.meta, _payload_from_obj(obj), caller_organ, expected_revision)
 
 
+def _validate_raw_path(path: str, label: str) -> None:
+    """Reject raw CLI path arguments containing traversal before any resolve."""
+    if ".." in Path(path).parts:
+        raise ContractInvalid(f"Path traversal rejected: {path}")
+
+
 def _validate_workspace_path(workspace: str) -> None:
-    """Reject paths with traversal or that aren't a git repo."""
-    p = Path(workspace)
-    if ".." in p.parts:
-        raise ContractInvalid(f"Path traversal rejected: {workspace}")
-    if not (p / ".git").exists():
+    """Reject paths that aren't inside a git repo.
+
+    Uses observe_git to resolve the real repository root, which allows
+    subdirectories of a git repo to be valid workspace paths.
+    """
+    from .world.git import observe_git
+    try:
+        observe_git(workspace)
+    except Exception:
         raise ContractInvalid(f"Not a git repository: {workspace}")
 
 
@@ -170,6 +180,14 @@ def _validate_runtime_not_in_workspace(workspace: str, runtime_dir: str) -> None
 
 def cmd_prepare(args: argparse.Namespace) -> int:
     """Execute the prepare command."""
+    # Validate raw paths BEFORE resolve
+    try:
+        _validate_raw_path(args.workspace, "workspace")
+        _validate_raw_path(args.runtime_dir, "runtime_dir")
+    except FurinaContractError as exc:
+        print(json.dumps({"error": exc.code, "message": exc.message}), file=sys.stderr)
+        return 1
+
     workspace = str(Path(args.workspace).resolve())
     runtime_dir = Path(args.runtime_dir).resolve()
 
@@ -284,7 +302,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                            current_refs=(snapshot.meta.integrity_ref, ctx.meta.integrity_ref))
         _write_obj(ledger, tr, "I2-D", 3)
 
-        # 10. Checkpoint
+        # 10. Checkpoint — causation_ref points to the deliberate/external_blocked TaskRun
         cp = Checkpoint.create(
             run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
             project_ref=proj, correlation_id=corr,
@@ -294,6 +312,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             pending_requests=("candidate_file",),
             snapshot_ref=snapshot.meta.integrity_ref,
             reason="prepare complete — awaiting external candidate",
+            causation_ref=tr.meta.integrity_ref,
         )
         _write_obj(ledger, cp, "I1-C", 0)
 
@@ -342,6 +361,14 @@ def _load_latest_object(ledger: Ledger, rb_id: str, object_type: str):
 
 def cmd_finalize(args: argparse.Namespace) -> int:
     """Execute the finalize command."""
+    # Validate raw paths BEFORE resolve
+    try:
+        _validate_raw_path(args.runtime_dir, "runtime_dir")
+        _validate_raw_path(args.candidate_file, "candidate_file")
+    except FurinaContractError as exc:
+        print(json.dumps({"error": exc.code, "message": exc.message}), file=sys.stderr)
+        return 1
+
     runtime_dir = Path(args.runtime_dir).resolve()
     db_path = str(runtime_dir / "inspect.sqlite3")
 
@@ -643,6 +670,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             bp=bp_obj, ctx=ctx_obj,
             ce=ce, vplan=vplan, agg_verdict=agg_verdict, cv=cv,
             causation_ref=cv.meta.integrity_ref,
+            task_run=new_tr,
         )
         for gate_ev in gate_evidences:
             _write_obj(ledger, gate_ev, "I4-C", 0)

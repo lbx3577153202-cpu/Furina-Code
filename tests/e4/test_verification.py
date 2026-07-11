@@ -138,9 +138,10 @@ class TestVerifyAgainstSnapshot:
         assert passed is True
 
     def test_unknown_step_raises(self):
+        from furina_code.contracts import ContractInvalid
         snap = _make_snapshot()
         cand = _make_candidate()
-        with pytest.raises(Exception):
+        with pytest.raises(ContractInvalid, match="Unknown verification step"):
             verify_candidate_against_snapshot(cand, snap, "nonexistent_step")
 
 
