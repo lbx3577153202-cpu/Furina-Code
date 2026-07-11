@@ -14,10 +14,12 @@
 | 架构 | x64 |
 | 本地 Python 列表 | 3.11.9, 3.13.14 |
 | 正式 E2 Python | 3.13.14 |
-| pip | (venv 内版本) |
-| setuptools | (构建时解析) |
+| pip | 26.1.2 |
+| setuptools 声明约束 | >=75 |
+| setuptools 本地实际解析 | 83.0.0 |
+| setuptools CI 策略 | 根据构建隔离环境解析满足约束的版本 |
 | pytest | 9.1.1 |
-| SQLite | (Python 内置) |
+| SQLite | 3.50.4 |
 | Git | 2.54.0.windows.1 |
 | main 基线 HEAD | 7da2c5819bbd3e0c3899a3f2b82d0d55e0ba5da2 |
 | E2 分支 | e2/technical-baseline-resource-verification |
@@ -57,7 +59,7 @@
 ### SQLite (Python sqlite3)
 
 - **来源:** Python 标准库
-- **实际版本:** 随 Python 3.13.14
+- **实际版本:** 3.50.4 (随 Python 3.13.14)
 - **用途:** 本地事务性存储
 - **引入方式:** 标准库适配器
 - **许可证:** Public Domain
@@ -96,7 +98,9 @@
 ### setuptools
 
 - **来源:** pypa/setuptools (GitHub)
-- **实际版本:** >=75 (构建时解析)
+- **声明约束:** >=75
+- **本地实际解析版本:** 83.0.0
+- **CI 实际解析策略:** 根据构建隔离环境解析满足约束的版本
 - **用途:** Python 包构建后端
 - **引入方式:** build dependency
 - **许可证:** MIT
