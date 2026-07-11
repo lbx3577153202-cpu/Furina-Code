@@ -1,7 +1,7 @@
 # MC1 Backend Port and Sandbox Contract V0.1
 
 **Date:** 2026-07-12
-**Stage:** MC1.1
+**Stage:** MC1.2
 **Status:** Candidate — activates after merge
 
 ---
@@ -48,7 +48,9 @@ BackendPort and any Adapter must NOT:
 
 - Adapter does NOT receive Ledger instance
 - Adapter package must NOT import ledger module
-- Adapter package must NOT import formal object factories
+- Adapter package must NOT import formal object factories (CandidateEnvelope, BackendProfile, etc.)
+- Adapter constructor must NOT accept Ledger as parameter
+- Adapter method signatures must NOT include Ledger
 - Only orchestrator / I2-D may write Ledger and create CandidateEnvelope
 
 ---
@@ -96,7 +98,7 @@ class BackendInvocationRequest:
     max_stdout_bytes: int
     max_stderr_bytes: int
     fresh_session: bool
-    sandbox_path: str
+    sandbox_path_ref: str  # relative or logical ref, not absolute
 ```
 
 ### 3.3 Invocation Plan
@@ -106,9 +108,19 @@ class BackendInvocationRequest:
 class BackendInvocationPlan:
     request: BackendInvocationRequest
     executable_args: tuple[str, ...]
-    cwd: str
-    env_allowlist: dict[str, str]
+    cwd_ref: str  # relative or logical ref, not absolute
+    env_policy_ref: str  # reference to environment policy, not actual values
+    env_key_allowlist: tuple[str, ...]  # key names only, no values
+    credential_mode: str
+    provider_state_policy_ref: str
 ```
+
+Actual environment values are resolved only at the final step of process launch:
+
+- Values are NOT serialized
+- Values are NOT recorded in DTOs, logs, Ledger, or invocation summary
+- Values are NOT included in command_args_digest or request_digest
+- Values are NOT included in exception messages
 
 ### 3.4 Transport Result
 
@@ -125,22 +137,22 @@ class BackendTransportResult:
     finished_at: str  # ISO 8601
     command_args_digest: str
 
-    stdout_ref: str | None  # path to stdout.bin
+    stdout_ref: str | None  # relative ref to stdout.bin
     stdout_digest: str | None
     stdout_bytes: int
     stdout_truncated: bool
 
-    stderr_ref: str | None  # path to stderr.bin
+    stderr_ref: str | None  # relative ref to stderr.bin
     stderr_digest: str | None
     stderr_bytes: int
     stderr_truncated: bool
 
-    candidate_ref: str | None  # path to candidate.json (Furina-generated)
+    candidate_ref: str | None  # relative ref to candidate.json
     candidate_digest: str | None
 
-    manifest_before_ref: str | None
+    manifest_before_ref: str | None  # relative ref to manifest_before.json
     manifest_before_digest: str | None
-    manifest_after_ref: str | None
+    manifest_after_ref: str | None  # relative ref to manifest_after.json
     manifest_after_digest: str | None
 
     transport_status: str  # see Section 10
@@ -148,7 +160,9 @@ class BackendTransportResult:
     error_detail: str | None
 ```
 
-### 3.5 Sandbox Manifest
+All `_ref` fields are relative to the external runtime root or logical URIs. They must NOT contain user-identity paths.
+
+### 3.5 Sandbox Manifest (Single Observation Point)
 
 ```python
 @dataclass(frozen=True)
@@ -164,19 +178,31 @@ class SandboxFileEntry:
 @dataclass(frozen=True)
 class SandboxManifest:
     invocation_id: str
-    sandbox_path: str
-    cwd_resolved: str
-    files_before: tuple[SandboxFileEntry, ...]
-    files_after: tuple[SandboxFileEntry, ...]
+    observation_point: str  # "before" | "after"
+    sandbox_path_ref: str  # relative ref, not absolute
+    cwd_resolved_ref: str  # relative ref, not absolute
+    entries: tuple[SandboxFileEntry, ...]
     manifest_digest: str  # canonical SHA-256 of sorted entries
 ```
 
-Manifest rules:
-- Relative paths only
-- Deterministic sort (by relative_path)
-- Canonical SHA-256 digest of entire manifest
-- All resolved targets must stay within sandbox
-- Detects: new files, deleted files, content changes, type changes, link target changes
+Each manifest captures ONE observation point. Two separate instances are created:
+
+```
+manifest_before.json  (observation_point = "before")
+manifest_after.json   (observation_point = "after")
+```
+
+Before/after diff is computed by Furina Code. Output:
+
+```
+added: [...]
+deleted: [...]
+content_changed: [...]
+type_changed: [...]
+link_target_changed: [...]
+```
+
+Each digest covers only its observation point's canonical manifest.
 
 ---
 
@@ -192,17 +218,22 @@ probe → prepare → invoke → collect → strict_validate → accepted | fail
 
 | Phase | FileBackend |
 |---|---|
-| probe | Always available (no executable needed) |
+| probe | No external executable dependency. Must probe: runtime root valid and outside repo, request directory creatable, context packet writable, candidate path valid, candidate file readable and not symlink. Result: available, unavailable, or awaiting_external |
 | prepare | Generate Context Packet in runtime directory |
 | invoke | No-op — await external candidate file |
 | collect | Read candidate file from specified path |
 | strict_validate | E4 candidate validator (exact JSON, schema, digest binding) |
 
+FileBackend probe results:
+- `available`: runtime root valid, directories creatable, context writable
+- `unavailable`: runtime root invalid, inside repo, or write failure
+- `awaiting_external`: runtime valid but no candidate file yet
+
 ### 4.2 MiMoCodeCLIAdapter Mapping
 
 | Phase | MiMoCodeCLIAdapter |
 |---|---|
-| probe | Confirm executable, version, flags, models |
+| probe | Confirm executable, version, flags, models; probe provider state isolation |
 | prepare | Create sandbox outside repository; write instruction + context packet |
 | invoke | Run `mimo run -- "<prompt>"` with new session, cwd=sandbox |
 | collect | Stream-bounded capture of stdout/stderr; save stdout.bin |
@@ -364,7 +395,7 @@ What CAN be reused:
 | No real main workspace | must not use real main working directory |
 | Symlink/junction boundary | resolved paths must stay within sandbox |
 | No repo runtime | runtime must not be placed inside repository |
-| Before/after manifest | capture file list before and after invocation |
+| Before/after manifest | two separate manifest objects for invocation evidence |
 
 ### 7.3 Manifest Requirements
 
@@ -382,7 +413,8 @@ resolved_target
 
 All resolved targets must remain within sandbox.
 
-Manifest must detect: new files, deleted files, content changes, type changes, link target changes.
+Two manifests are generated independently. Furina Code computes diff:
+added, deleted, content_changed, type_changed, link_target_changed.
 
 ---
 
@@ -401,12 +433,21 @@ Manifest must detect: new files, deleted files, content changes, type changes, l
 
 ### 8.2 Environment Variables
 
-Strategy: explicit allowlist only.
+Strategy: explicit key allowlist only. No actual values stored in DTOs.
+
+```python
+env_key_allowlist: ("HOME", "PATH", "TMPDIR", ...)
+```
+
+Actual values resolved only at process launch time:
+- NOT serialized into DTOs
+- NOT recorded in logs, Ledger, or invocation summary
+- NOT included in command_args_digest or request_digest
+- NOT included in exception messages
 
 Must NOT pass raw `HOME` or `USERPROFILE` directly as safe environment.
 
 Must distinguish:
-
 - credential state
 - config state
 - session/database state
@@ -414,7 +455,6 @@ Must distinguish:
 - default working directory
 
 MC1 implementation must separately probe whether the following can be isolated:
-
 - config root
 - data/session root
 - workspace trust state
@@ -430,7 +470,6 @@ FileBackend: AVAILABLE
 Explicit cwd does NOT substitute for user-level state isolation proof.
 
 Must NOT read, copy, or record:
-
 - API key
 - auth.json contents
 - cookie
@@ -439,7 +478,6 @@ Must NOT read, copy, or record:
 - credential path user-identity portion
 
 May record:
-
 - credential_mode
 - provider_ref
 - config existence
@@ -465,7 +503,6 @@ If either stream exceeds hard limit:
 ### 8.4 Process Tree Termination
 
 On timeout:
-
 - Kill the entire child process tree
 - Do NOT assume no side effects
 - Do NOT automatically reuse the same session
@@ -477,7 +514,7 @@ On timeout:
 
 ### 9.1 Request Digest
 
-At minimum, the request digest covers:
+At minimum, the request digest covers (NO credential values):
 
 ```
 backend_profile_ref
@@ -491,6 +528,8 @@ timeout
 output size limits
 fresh-session policy
 ```
+
+`command_args_digest` and `request_digest` must NOT contain API key, token, cookie, or other credential values.
 
 ### 9.2 Replay Rules
 
@@ -512,7 +551,13 @@ fresh-session policy
 
 ## 10. TransportResult Status Collection (14 statuses)
 
-| Status | Retry | New invocation_id | Provider session | TaskRun suggestion | Allow completed |
+All retry columns renamed to `upper_layer_retry_eligible`.
+
+**Adapter NEVER auto-retries. All retries are decided by the upper-layer orchestrator.**
+
+Any retry MUST create new invocation_id and new provider session.
+
+| Status | upper_layer_retry_eligible | New invocation_id | Provider session | TaskRun suggestion | Allow completed |
 |---|---|---|---|---|---|
 | `succeeded` | no | no | new | N/A | candidate processing only |
 | `awaiting_external` | N/A | no | N/A | external_blocked | no |
@@ -538,6 +583,8 @@ fresh-session policy
 - Manifest inconsistency
 
 Adapter NEVER auto-retries on sandbox_violation.
+
+For `authentication_failed`, `sandbox_violation`, `ambiguous`: default is `upper_layer_retry_eligible = no`. Retry only after user fixes auth, policy, or environment.
 
 ### 10.1 TaskRun Mapping
 
@@ -597,7 +644,14 @@ MC1 implementation must pass at minimum:
 | BackendPort unknown provider fail-closed | raises error |
 | BackendProfile only created by I2-B | adapter write rejected |
 | Adapter cannot write Ledger | Ledger write rejected |
-| Adapter does not receive Ledger instance | import error |
+| Adapter does not receive Ledger instance | structural: no Ledger import |
+| backend/adapters import ledger module | fail at import time |
+| backend/adapters import CandidateEnvelope factory | fail at import time |
+| backend/adapters import BackendProfile factory | fail at import time |
+| Adapter constructor receives Ledger | type error |
+| Adapter method parameter contains Ledger | type error |
+| Transport DTO contains env value field | structurally absent |
+| Transport DTO contains absolute user path | structurally absent |
 | Real repository as cwd rejected | sandbox_violation |
 | Runtime inside repository rejected | sandbox_violation |
 | Legacy repository path rejected | sandbox_violation |
@@ -625,6 +679,7 @@ MC1 implementation must pass at minimum:
 | Heuristic JSON extraction absent | verified |
 | HOME/USERPROFILE not passed raw | verified |
 | Provider state isolation probed | verified |
+| Environment values not stored in DTOs | verified |
 | FileBackend regression equivalence | all 270 tests pass |
 | Real repository unchanged before/after | git status clean |
 | Credentials not in logs, Ledger, or Git | verified |
