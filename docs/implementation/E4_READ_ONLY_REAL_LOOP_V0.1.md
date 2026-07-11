@@ -128,7 +128,7 @@ No authorize/act/reconcile in E4.
 ## 8. Test Results
 
 ```
-265/265 passed (78 E3 + 187 E4)
+270/270 passed (78 E3 + 192 E4)
 Python 3.12: SUCCESS
 Python 3.13: SUCCESS
 pip check: No broken requirements found
@@ -139,13 +139,14 @@ pip check: No broken requirements found
 ## 9. Real Repository Run
 
 ```
-result_head: 5f087f4fadb0a6f0fe8fb5fe4719156ed000d8d3
+result_head: 6a3744c8b47d119fbfd9221aa2dd79165780097b
 branch: e4/read-only-real-loop
+workspace: repository subdirectory (tests/e4)
+runtime: outside repository root (Temp directory)
 finalize: outcome=completed
 10/10 verification steps passed
 6/6 read-only gates passed (IL-G0/G1/G2/G4/G6/G7)
 workspace unchanged
-runtime located outside repository root
 ```
 
 ---

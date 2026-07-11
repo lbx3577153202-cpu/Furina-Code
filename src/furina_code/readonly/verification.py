@@ -483,32 +483,53 @@ def evaluate_gate(
 
             # Exact check-to-evidence mapping using actual EvidenceEnvelope objects
             if verification_evidence is not None:
-                # Build map: check → evidence integrity_ref
-                check_to_evidence: dict[str, str] = {}
+                # Build map: check → list of evidence integrity_refs
+                check_to_evidence_refs: dict[str, list[str]] = {}
+                all_verification_ref_set: set[str] = set()
                 for ev in verification_evidence:
-                    # claim_scope is "verification:<check_name>"
                     if ev.claim_scope.startswith("verification:"):
                         check_name = ev.claim_scope.split(":", 1)[1]
-                        check_to_evidence[check_name] = ev.meta.integrity_ref
+                        check_to_evidence_refs.setdefault(check_name, []).append(ev.meta.integrity_ref)
+                        all_verification_ref_set.add(ev.meta.integrity_ref)
 
                 conditions.append("each check has exactly one evidence")
                 for check in vplan.checks:
-                    if check not in check_to_evidence:
+                    refs = check_to_evidence_refs.get(check, [])
+                    if len(refs) == 0:
                         failed.append(f"check '{check}' has no evidence")
-                    elif check_to_evidence[check] not in agg_verdict.evidence_refs:
+                    elif len(refs) > 1:
+                        failed.append(f"check '{check}' has {len(refs)} evidence (expected 1)")
+                    elif refs[0] not in agg_verdict.evidence_refs:
                         failed.append(f"check '{check}' evidence not in verdict refs")
 
                 conditions.append("no extra verification evidence")
-                extra = set(check_to_evidence.keys()) - set(vplan.checks)
-                if extra:
-                    failed.append(f"extra evidence for checks not in plan: {extra}")
+                extra_checks = set(check_to_evidence_refs.keys()) - set(vplan.checks)
+                if extra_checks:
+                    failed.append(f"extra evidence for checks not in plan: {extra_checks}")
 
-                # Verdict refs must equal the required evidence set
-                required_ev_refs = frozenset(check_to_evidence.get(c, "") for c in vplan.checks)
+                # Check for duplicate integrity_refs across all verification evidence
+                conditions.append("no duplicate evidence integrity_refs")
+                all_refs = [ev.meta.integrity_ref for ev in verification_evidence
+                            if ev.claim_scope.startswith("verification:")]
+                if len(set(all_refs)) != len(all_refs):
+                    failed.append("duplicate evidence integrity_refs found")
+
+                # Verdict refs must equal the required evidence set (no missing, no extra)
+                required_ev_refs = frozenset(
+                    check_to_evidence_refs[c][0] for c in vplan.checks
+                    if c in check_to_evidence_refs and len(check_to_evidence_refs[c]) == 1
+                )
                 actual_ev_refs = frozenset(agg_verdict.evidence_refs)
                 conditions.append("verdict refs equal required evidence set")
                 if required_ev_refs != actual_ev_refs:
-                    failed.append(f"verdict evidence_refs mismatch: required={len(required_ev_refs)} actual={len(actual_ev_refs)}")
+                    missing = required_ev_refs - actual_ev_refs
+                    extra = actual_ev_refs - required_ev_refs
+                    parts = []
+                    if missing:
+                        parts.append(f"missing={len(missing)}")
+                    if extra:
+                        parts.append(f"extra={len(extra)}")
+                    failed.append(f"verdict evidence_refs mismatch: {', '.join(parts)}")
 
             conditions.append("coverage == 1.0")
             if agg_verdict.coverage < 1.0:

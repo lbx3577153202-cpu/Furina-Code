@@ -268,3 +268,136 @@ class TestG7CurrentHeads:
                            current_heads=current_heads)
         assert gr.outcome == "fail"
         assert any("VerificationVerdict" in f and "not current head" in f for f in gr.failed_conditions)
+
+    def test_g7_rejects_stale_task_run(self):
+        """G7 must reject stale TaskRun."""
+        from furina_code.contracts.objects import CompletionVerdict, TaskRun, Phase, Disposition
+        from furina_code.contracts.meta import now_utc, SCHEMA_VERSION, compute_integrity_ref, CanonicalMeta
+        now = now_utc()
+        tr_meta_fields = {
+            "schema_version": SCHEMA_VERSION, "object_type": "TaskRun", "object_id": "tr-1",
+            "revision": 1, "owner_organ": "I2-D", "run_binding_id": "rb-1",
+            "task_id": "t-1", "task_run_id": "tr-1", "project_ref": "p",
+            "correlation_id": "c", "causation_ref": None,
+            "created_at": now.isoformat(), "recorded_at": now.isoformat(),
+            "classification": "project_internal", "supersedes_ref": None,
+        }
+        tr_payload = {"task_revision": 1, "phase": "terminal", "disposition": "terminal",
+                      "current_refs": [], "open_requests": [],
+                      "started_at": now.isoformat(), "terminal_reason": "completed"}
+        tr_integrity = compute_integrity_ref(tr_meta_fields, tr_payload)
+        tr_meta = CanonicalMeta(**{**tr_meta_fields, "integrity_ref": tr_integrity,
+                                    "created_at": now, "recorded_at": now})
+        tr = TaskRun(meta=tr_meta, task_revision=1, phase=Phase.TERMINAL,
+                     disposition=Disposition.TERMINAL, current_refs=(), open_requests=(),
+                     started_at=now, terminal_reason="completed")
+
+        cv = CompletionVerdict.create(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            task_revision=1, task_run_ref=tr.meta.integrity_ref,
+            verification_ref="sha256:vv",
+            candidate_ref="sha256:ce", outcome="completed",
+            completed_items=("c1",),
+            no_project_side_effect=True,
+            user_effect="No project files modified.",
+        )
+        current_heads = {
+            "CompletionVerdict": cv.meta.integrity_ref,
+            "VerificationVerdict": "sha256:vv",
+            "TaskRun": "sha256:different_tr_head",
+        }
+        gr = evaluate_gate("IL-G7", None, None, None, None, None, None, None, None, cv,
+                           task_run=tr, current_heads=current_heads)
+        assert gr.outcome == "fail"
+        assert any("TaskRun" in f and "not current head" in f for f in gr.failed_conditions)
+
+
+# === Section 5: G6 failure tests ===
+
+class TestG6FailureCases:
+    def _make_vplan(self):
+        from furina_code.contracts.objects import VerificationPlan
+        return VerificationPlan.create(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            task_revision=1, candidate_ref="sha256:ce",
+            success_criteria_map={"c1": "check-a", "c2": "check-b"},
+            success_criteria=("c1", "c2"),
+            checks=("check-a", "check-b"),
+        )
+
+    def _make_evidence(self, claim_scope, ref_suffix="ev1"):
+        from furina_code.contracts.objects import EvidenceEnvelope
+        return EvidenceEnvelope.create(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            claim_scope=claim_scope, evidence_type="existence_check",
+            source_ref="test", claim="test claim",
+            envelope_id=f"t-1:evidence:{ref_suffix}",
+        )
+
+    def _make_verdict(self, evidence_refs, coverage=1.0, outcome="pass"):
+        return VerificationVerdict.create(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            plan_ref="sha256:vp", evidence_refs=evidence_refs,
+            criterion_results={"c1": "pass", "c2": "pass"},
+            coverage=coverage, outcome=outcome, reason="test",
+        )
+
+    def test_g6_fails_when_evidence_missing(self):
+        """G6 must fail when a check has no evidence."""
+        vplan = self._make_vplan()
+        # Only provide evidence for check-a, not check-b
+        ev_a = self._make_evidence("verification:check-a", "ev-a")
+        vv = self._make_verdict(evidence_refs=(ev_a.meta.integrity_ref,))
+
+        gr = evaluate_gate("IL-G6", None, None, None, None, None, None, vplan, vv, None,
+                           verification_evidence=[ev_a])
+        assert gr.outcome == "fail"
+        assert any("check-b" in f and "no evidence" in f for f in gr.failed_conditions)
+
+    def test_g6_fails_when_check_has_duplicate_evidence(self):
+        """G6 must fail when a check has two or more evidence."""
+        vplan = self._make_vplan()
+        ev_a1 = self._make_evidence("verification:check-a", "ev-a1")
+        ev_a2 = self._make_evidence("verification:check-a", "ev-a2")
+        ev_b = self._make_evidence("verification:check-b", "ev-b")
+        # Verdict refs all three
+        vv = self._make_verdict(evidence_refs=(
+            ev_a1.meta.integrity_ref, ev_a2.meta.integrity_ref, ev_b.meta.integrity_ref,
+        ))
+
+        gr = evaluate_gate("IL-G6", None, None, None, None, None, None, vplan, vv, None,
+                           verification_evidence=[ev_a1, ev_a2, ev_b])
+        assert gr.outcome == "fail"
+        assert any("check-a" in f and "2 evidence" in f for f in gr.failed_conditions)
+
+    def test_g6_fails_when_extra_verification_evidence_exists(self):
+        """G6 must fail when evidence exists for checks not in plan."""
+        vplan = self._make_vplan()
+        ev_a = self._make_evidence("verification:check-a", "ev-a")
+        ev_b = self._make_evidence("verification:check-b", "ev-b")
+        ev_extra = self._make_evidence("verification:check-c", "ev-extra")
+        vv = self._make_verdict(evidence_refs=(
+            ev_a.meta.integrity_ref, ev_b.meta.integrity_ref, ev_extra.meta.integrity_ref,
+        ))
+
+        gr = evaluate_gate("IL-G6", None, None, None, None, None, None, vplan, vv, None,
+                           verification_evidence=[ev_a, ev_b, ev_extra])
+        assert gr.outcome == "fail"
+        assert any("extra" in f.lower() and "check-c" in f for f in gr.failed_conditions)
+
+    def test_g6_fails_when_verdict_refs_do_not_equal_required_set(self):
+        """G6 must fail when verdict refs don't match required evidence set."""
+        vplan = self._make_vplan()
+        ev_a = self._make_evidence("verification:check-a", "ev-a")
+        ev_b = self._make_evidence("verification:check-b", "ev-b")
+        # Verdict missing ev_b
+        vv = self._make_verdict(evidence_refs=(ev_a.meta.integrity_ref,))
+
+        gr = evaluate_gate("IL-G6", None, None, None, None, None, None, vplan, vv, None,
+                           verification_evidence=[ev_a, ev_b])
+        assert gr.outcome == "fail"
+        assert any("verdict" in f.lower() and "mismatch" in f.lower() for f in gr.failed_conditions)
