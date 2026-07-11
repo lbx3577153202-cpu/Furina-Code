@@ -1,0 +1,134 @@
+"""E4 tests — candidate file validation."""
+
+import json
+import pytest
+from pathlib import Path
+from furina_code.contracts import ContractInvalid
+from furina_code.backend.candidate import (
+    validate_candidate_file,
+    validate_candidate_content,
+    create_candidate_envelope,
+)
+
+
+class TestValidateCandidateFile:
+    def test_valid_file(self, tmp_path):
+        f = tmp_path / "candidate.json"
+        f.write_text('{"test": true}')
+        content, sha = validate_candidate_file(str(f))
+        assert content == '{"test": true}'
+        assert len(sha) == 64  # sha256 hex
+
+    def test_missing_file(self, tmp_path):
+        with pytest.raises(ContractInvalid):
+            validate_candidate_file(str(tmp_path / "nonexistent.json"))
+
+    def test_empty_file(self, tmp_path):
+        f = tmp_path / "empty.json"
+        f.write_text("")
+        with pytest.raises(ContractInvalid):
+            validate_candidate_file(str(f))
+
+    def test_too_large(self, tmp_path):
+        f = tmp_path / "large.json"
+        f.write_bytes(b"x" * (11 * 1024 * 1024))  # 11 MB
+        with pytest.raises(ContractInvalid):
+            validate_candidate_file(str(f))
+
+
+class TestValidateCandidateContent:
+    def _make_valid_candidate(self, context_ref="sha256:abc", backend_ref="e4-repository-baseline-v1"):
+        return json.dumps({
+            "schema_version": "1.0",
+            "candidate_type": "repository_baseline_report",
+            "backend_profile_ref": backend_ref,
+            "backend_session_ref": "session-1",
+            "context_ref": context_ref,
+            "context_digest": "sha256:abc",
+            "content": {
+                "repository_head": "a" * 40,
+                "branch": "main",
+                "working_tree": "clean",
+                "tracked_file_count": 10,
+                "untracked_file_count": 0,
+                "python_requires": ">=3.12",
+                "runtime_dependencies": [],
+                "dev_dependencies": ["pytest"],
+                "pytest_testpaths": ["tests"],
+                "ci_config": {"present": True, "sha256": "sha256:abc"},
+                "blind_spots": [],
+                "summary": "test repo",
+            },
+            "claimed_assumptions": [],
+            "requested_actions": [],
+        })
+
+    def test_valid_candidate(self):
+        data = validate_candidate_content(
+            self._make_valid_candidate(), "sha256:abc", "e4-repository-baseline-v1"
+        )
+        assert data["schema_version"] == "1.0"
+
+    def test_invalid_json(self):
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content("not json", "sha256:abc", "e4-repository-baseline-v1")
+
+    def test_wrong_schema_version(self):
+        content = self._make_valid_candidate().replace('"1.0"', '"2.0"')
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(content, "sha256:abc", "e4-repository-baseline-v1")
+
+    def test_wrong_candidate_type(self):
+        content = self._make_valid_candidate().replace(
+            "repository_baseline_report", "unknown_type"
+        )
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(content, "sha256:abc", "e4-repository-baseline-v1")
+
+    def test_context_ref_mismatch(self):
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(
+                self._make_valid_candidate(), "sha256:WRONG", "e4-repository-baseline-v1"
+            )
+
+    def test_backend_ref_mismatch(self):
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(
+                self._make_valid_candidate(), "sha256:abc", "WRONG_BACKEND"
+            )
+
+    def test_nonempty_requested_actions(self):
+        content = self._make_valid_candidate().replace(
+            '"requested_actions": []', '"requested_actions": ["do_something"]'
+        )
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(content, "sha256:abc", "e4-repository-baseline-v1")
+
+    def test_missing_content_section(self):
+        content = json.dumps({
+            "schema_version": "1.0",
+            "candidate_type": "repository_baseline_report",
+            "backend_profile_ref": "e4-repository-baseline-v1",
+            "backend_session_ref": "s",
+            "context_ref": "sha256:abc",
+            "context_digest": "sha256:abc",
+            "claimed_assumptions": [],
+            "requested_actions": [],
+        })
+        with pytest.raises(ContractInvalid):
+            validate_candidate_content(content, "sha256:abc", "e4-repository-baseline-v1")
+
+
+class TestCreateCandidateEnvelope:
+    def test_create(self, tmp_path):
+        f = tmp_path / "candidate.json"
+        f.write_text('{"schema_version": "1.0"}')
+        ce = create_candidate_envelope(
+            run_binding_id="rb-1", task_id="t-1", task_run_id="tr-1",
+            project_ref="p", correlation_id="c",
+            context_envelope_ref="sha256:abc",
+            candidate_path=str(f), backend_id="test",
+        )
+        assert ce.meta.object_type == "CandidateEnvelope"
+        assert ce.candidate_sha256.startswith("")
+        assert len(ce.candidate_sha256) == 64
