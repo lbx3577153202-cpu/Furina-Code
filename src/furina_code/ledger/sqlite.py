@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..contracts.errors import (
+    FurinaContractError,
     ContractInvalid,
     AuthorityViolation,
     BindingMismatch,
@@ -138,30 +139,58 @@ class Ledger:
         row = cur.fetchone()
         return row[0] if row else 0
 
-    def get_revision(self, object_type: str, object_id: str, revision: int) -> tuple[CanonicalMeta, dict] | None:
+    def get_revision(self, object_type: str, object_id: str, revision: int) -> tuple[CanonicalMeta, dict]:
         cur = self.conn.execute(
-            "SELECT object_type, object_id, meta_json, payload_json, integrity_ref "
+            "SELECT object_type, object_id, revision, meta_json, payload_json, integrity_ref "
             "FROM object_revisions WHERE object_type=? AND object_id=? AND revision=?",
             (object_type, object_id, revision),
         )
         row = cur.fetchone()
         if row is None:
-            return None
+            raise IntegrityCheckFailed(
+                f"Revision {revision} not found for {object_type}:{object_id}",
+                {"object_type": object_type, "object_id": object_id, "revision": revision},
+            )
 
-        stored_integrity_ref = row[4]
-        meta = self._load_meta((row[0], row[1], row[2]))
-        payload = json.loads(row[3])
+        row_object_type = row[0]
+        row_object_id = row[1]
+        row_revision = row[2]
+        stored_integrity_ref = row[5]
+        meta = self._load_meta((row[0], row[1], row[3]))
+        payload = json.loads(row[4])
+
+        # Cross-check: requested values vs column values
+        if row_object_type != object_type:
+            raise IntegrityCheckFailed(
+                "Column object_type does not match requested object_type",
+                {"requested": object_type, "column": row_object_type},
+            )
+        if row_object_id != object_id:
+            raise IntegrityCheckFailed(
+                "Column object_id does not match requested object_id",
+                {"requested": object_id, "column": row_object_id},
+            )
+        if row_revision != revision:
+            raise IntegrityCheckFailed(
+                "Column revision does not match requested revision",
+                {"requested": revision, "column": row_revision},
+            )
 
         # Cross-check: column values vs meta JSON values
-        if row[0] != meta.object_type:
+        if row_object_type != meta.object_type:
             raise IntegrityCheckFailed(
                 "Column object_type mismatch with meta_json",
-                {"column": row[0], "meta": meta.object_type},
+                {"column": row_object_type, "meta": meta.object_type},
             )
-        if row[1] != meta.object_id:
+        if row_object_id != meta.object_id:
             raise IntegrityCheckFailed(
                 "Column object_id mismatch with meta_json",
-                {"column": row[1], "meta": meta.object_id},
+                {"column": row_object_id, "meta": meta.object_id},
+            )
+        if row_revision != meta.revision:
+            raise IntegrityCheckFailed(
+                "Column revision mismatch with meta_json",
+                {"column": row_revision, "meta": meta.revision},
             )
 
         # Cross-check: stored integrity_ref in column vs in meta_json
@@ -186,6 +215,8 @@ class Ledger:
         rev = self.get_head_revision(object_type, object_id)
         if rev == 0:
             return None
+        # Fail-closed: if head points to a revision that doesn't exist or
+        # fails integrity, propagate the error instead of returning None.
         return self.get_revision(object_type, object_id, rev)
 
     # --------------------------------------------------------------- write
@@ -222,7 +253,6 @@ class Ledger:
 
             # ---- revision check ----
             if expected_revision != current_rev:
-                self.conn.rollback()
                 raise RevisionConflict(
                     f"expected_revision={expected_revision} but current={current_rev} "
                     f"for {meta.object_type}:{meta.object_id}",
@@ -231,7 +261,6 @@ class Ledger:
 
             # ---- exact next revision ----
             if meta.revision != current_rev + 1:
-                self.conn.rollback()
                 raise RevisionConflict(
                     f"revision must be {current_rev + 1}, got {meta.revision}",
                     {"expected": current_rev + 1, "got": meta.revision},
@@ -240,7 +269,6 @@ class Ledger:
             # ---- supersedes_ref ----
             if current_rev == 0:
                 if meta.supersedes_ref is not None:
-                    self.conn.rollback()
                     raise ContractInvalid(
                         "supersedes_ref must be None for initial creation",
                         {"supersedes_ref": meta.supersedes_ref},
@@ -248,7 +276,6 @@ class Ledger:
             else:
                 expected_supersedes = f"{meta.object_type}:{meta.object_id}:rev{current_rev}"
                 if meta.supersedes_ref != expected_supersedes:
-                    self.conn.rollback()
                     raise ContractInvalid(
                         f"supersedes_ref must be {expected_supersedes}",
                         {"expected": expected_supersedes, "got": meta.supersedes_ref},
@@ -263,7 +290,6 @@ class Ledger:
                 )
                 prev_row = cur.fetchone()
                 if prev_row is None:
-                    self.conn.rollback()
                     raise LedgerWriteFailed(
                         f"Previous revision {current_rev} not found for "
                         f"{meta.object_type}:{meta.object_id}",
@@ -272,7 +298,6 @@ class Ledger:
                 new_meta = meta.to_dict()
                 for field in _STABLE_FIELDS:
                     if prev_meta.get(field) != new_meta.get(field):
-                        self.conn.rollback()
                         raise BindingMismatch(
                             f"Stable field '{field}' changed between revisions",
                             {
@@ -286,7 +311,6 @@ class Ledger:
             meta_fields = meta.meta_fields_for_integrity()
             expected_ref = compute_integrity_ref(meta_fields, payload)
             if meta.integrity_ref != expected_ref:
-                self.conn.rollback()
                 raise IntegrityCheckFailed(
                     "integrity_ref does not match computed hash",
                     {"provided": meta.integrity_ref, "computed": expected_ref},
@@ -314,7 +338,7 @@ class Ledger:
                 (meta.object_type, meta.object_id, meta.revision),
             )
 
-            # ---- sequence inside transaction ----
+            # ---- sequence inside transaction (single source of truth) ----
             cur.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM event_envelopes")
             next_seq = cur.fetchone()[0]
 
@@ -343,11 +367,12 @@ class Ledger:
 
             cur.execute(
                 "INSERT INTO event_envelopes "
-                "(event_id, event_type, aggregate_ref, aggregate_revision, "
+                "(sequence, event_id, event_type, aggregate_ref, aggregate_revision, "
                 "producer_organ, run_binding_id, task_run_id, correlation_id, "
                 "causation_ref, occurred_at, recorded_at, payload_ref, integrity_ref) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    next_seq,
                     event_id, event_type,
                     f"{meta.object_type}:{meta.object_id}",
                     meta.revision,
@@ -366,17 +391,19 @@ class Ledger:
             cur.execute("COMMIT")
 
         except sqlite3.IntegrityError as exc:
-            self.conn.rollback()
+            if self.conn.in_transaction:
+                self.conn.rollback()
             raise LedgerWriteFailed(
                 "SQLite integrity constraint violated during write",
                 {"sqlite_error": str(exc)},
             ) from exc
-        except (RevisionConflict, ContractInvalid, BindingMismatch,
-                IntegrityCheckFailed, AuthorityViolation):
-            # Already rolled back above; re-raise as-is
+        except FurinaContractError:
+            if self.conn.in_transaction:
+                self.conn.rollback()
             raise
         except Exception as exc:
-            self.conn.rollback()
+            if self.conn.in_transaction:
+                self.conn.rollback()
             raise LedgerWriteFailed(
                 f"Unexpected error during ledger write: {type(exc).__name__}",
                 {"error": str(exc)},
@@ -385,6 +412,11 @@ class Ledger:
     # --------------------------------------------------------------- events
 
     def get_events(self, run_binding_id: str) -> list[dict[str, Any]]:
+        """Internal diagnostic: raw event read without integrity verification.
+
+        NOT for use by ContinuityView or formal business paths.
+        Use get_verified_events() for all integrity-checked reads.
+        """
         cur = self.conn.execute(
             "SELECT * FROM event_envelopes WHERE run_binding_id=? ORDER BY sequence",
             (run_binding_id,),

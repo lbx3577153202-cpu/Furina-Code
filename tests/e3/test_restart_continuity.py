@@ -3,7 +3,7 @@
 import pytest
 from furina_code.contracts import (
     RunBinding, TaskDossier, TaskRun, Checkpoint,
-    Phase, Disposition, BindingMismatch,
+    Phase, Disposition, BindingMismatch, IntegrityCheckFailed,
 )
 from furina_code.ledger import Ledger
 from furina_code.continuity import rebuild_continuity
@@ -137,6 +137,6 @@ class TestRestartContinuity:
 
         ledger2 = Ledger(db_path)
         ledger2.open()
-        with pytest.raises(Exception):
+        with pytest.raises(IntegrityCheckFailed):
             rebuild_continuity(ledger2, "rb-1")
         ledger2.close()

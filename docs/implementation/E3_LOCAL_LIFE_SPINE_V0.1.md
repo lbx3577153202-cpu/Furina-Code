@@ -1,7 +1,7 @@
 # E3 本地持续生命脊柱
 
 **任务编号:** E3
-**状态:** E3.1 实施证据，待 PR 审查
+**状态:** E3.2 实施证据，待 PR 审查
 **日期:** 2026-07-11
 
 ---
@@ -181,7 +181,7 @@ Sequence is assigned inside the transaction (SELECT MAX+1) to prevent duplicates
 ## 12. Test Results
 
 ```
-66/66 passed (53 E3 + 13 E2 baseline)
+75/75 passed (62 E3 + 13 E2 baseline)
 pip check: No broken requirements found
 ```
 
@@ -205,6 +205,18 @@ Issues found during E3 initial review:
 
 ---
 
+## 13b. E3.2 Corrections Summary
+
+Issues found during E3.1 review:
+1. `get_revision()` did not read/select the `revision` column → now selects all 6 columns and cross-checks column revision vs requested vs meta_json
+2. `get_latest()` returned None when head > 0 but revision missing → now raises IntegrityCheckFailed (fail-closed)
+3. `write_object()` had per-checkpoint manual rollback → unified try/except structure with `conn.in_transaction` guard
+4. `canonical_json_dumps()` only caught ValueError → now catches both ValueError and TypeError
+5. Event INSERT did not explicitly include `sequence` column → now uses explicit `(sequence, ...)` INSERT with same variable used for integrity
+6. `get_events()` was used by formal paths → docstring marks it as internal diagnostic; ContinuityView uses `get_verified_events()` only
+
+---
+
 ## 14. Proven Capabilities
 
 - Formal objects with unique OWNER
@@ -222,7 +234,12 @@ Issues found during E3 initial review:
 - Missing binding fail-closed
 - P4 back edges (deliberate↔observe/verify, authorize/reconcile/verify/adjudicate→deliberate)
 - recovery_review without RecoveryVerdict rejected
-- Integrity tamper detection
+- Integrity tamper detection (object revision column, meta_json, head integrity)
+- Revision column cross-check (requested vs column vs meta_json)
+- Broken head fail-closed (get_latest raises, not returns None)
+- Unified transaction rollback (conn.in_transaction guard)
+- Canonical JSON catches ValueError and TypeError
+- Event sequence explicit INSERT (single source of truth)
 - Restart continuity rebuild
 - Runtime data git-ignored
 

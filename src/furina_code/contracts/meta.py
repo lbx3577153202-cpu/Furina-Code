@@ -42,7 +42,7 @@ def canonical_json_dumps(obj: Any) -> str:
             separators=(",", ":"),
             allow_nan=False,
         )
-    except ValueError:
+    except (ValueError, TypeError):
         raise ContractInvalid(
             "Value not JSON-serializable or contains NaN/Infinity",
             {"value_type": type(obj).__name__},
