@@ -38,32 +38,84 @@ def _sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+# --- Link/reparse detection ---
+
+def _is_link_or_reparse(path: Path) -> bool:
+    """Check if path is a symlink, junction, or reparse point. Cross-platform."""
+    # POSIX symlink check
+    if path.is_symlink():
+        return True
+
+    # Windows-specific checks (only if path exists or lstat succeeds)
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+
+    # Check for reparse point via stat
+    if hasattr(st, "st_file_attributes"):
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        if st.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+
+    # Check for junction via is_junction (Python 3.12+)
+    if hasattr(path, "is_junction"):
+        try:
+            if path.is_junction():
+                return True
+        except OSError:
+            pass
+
+    return False
+
+
+def _assert_no_links_in_path(path: Path) -> None:
+    """Check that no component of path is a link/reparse. Fail-closed."""
+    current = path
+    while current != current.parent:
+        if _is_link_or_reparse(current):
+            raise ContractInvalid("Path component is link/reparse")
+        current = current.parent
+
+
 # --- Path validation ---
 
 def _validate_sandbox_ref(sandbox_path_ref: str) -> None:
-    """Reject absolute, traversal, empty, or dot refs before any resolution."""
+    """Reject absolute, traversal, empty, dot, backslash, or Windows refs."""
     if not sandbox_path_ref:
         raise ContractInvalid("Sandbox ref must not be empty")
-    ref_path = Path(sandbox_path_ref)
-    # Cross-platform absolute check
-    if ref_path.is_absolute():
+
+    # Reject backslash (Windows-style separator)
+    if "\\" in sandbox_path_ref:
+        raise ContractInvalid("Sandbox ref must use forward slashes")
+
+    # Cross-platform absolute checks
+    ref_posix = PurePosixPath(sandbox_path_ref)
+    ref_win = PureWindowsPath(sandbox_path_ref)
+    if ref_posix.is_absolute():
         raise ContractInvalid("Sandbox ref must be relative")
-    if PureWindowsPath(sandbox_path_ref).is_absolute():
+    if ref_win.is_absolute():
         raise ContractInvalid("Sandbox ref must be relative")
-    # Check for Windows drive letter (C:foo)
+
+    # Check for Windows drive letter (C:foo, C:/foo)
     if len(sandbox_path_ref) >= 2 and sandbox_path_ref[1] == ":":
         raise ContractInvalid("Sandbox ref must be relative")
+
     # Check for UNC paths
     if sandbox_path_ref.startswith("\\\\") or sandbox_path_ref.startswith("//"):
         raise ContractInvalid("Sandbox ref must be relative")
-    if ".." in ref_path.parts:
+
+    # Traversal check (using forward slashes)
+    if ".." in ref_posix.parts:
         raise ContractInvalid("Sandbox ref contains traversal")
-    if ref_path == Path("."):
+
+    # Dot check
+    if ref_posix == PurePosixPath("."):
         raise ContractInvalid("Sandbox ref must not be '.'")
 
 
 def _paths_overlap(root_a: Path, root_b: Path) -> bool:
-    """Check if two paths overlap (contain each other or are equal)."""
+    """Check if two canonical paths overlap (contain each other or are equal)."""
     try:
         root_b.relative_to(root_a)
         return True
@@ -89,12 +141,8 @@ def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
     except ValueError:
         raise ContractInvalid("Sandbox escapes runtime root")
 
-    # Check for symlink/junction escape at each parent level
-    current = resolved
-    while current != current.parent:
-        if current.is_symlink():
-            raise ContractInvalid("Sandbox path component is symlink")
-        current = current.parent
+    # Check for link/reparse at each parent level
+    _assert_no_links_in_path(resolved)
 
     return resolved
 
@@ -102,18 +150,23 @@ def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
 # --- Safe file reading ---
 
 def _read_regular_file_once_no_follow(path: Path, max_bytes: int) -> bytes:
-    """Read a file with pre-lstat, O_NOFOLLOW (Unix), identity check, bounded loop, post-read identity check."""
+    """Read a file with pre-lstat, no-follow, identity check, bounded loop, post-read identity check."""
     # Pre-open lstat check
     try:
         pre_stat = os.lstat(str(path))
     except OSError as exc:
         raise ContractInvalid(f"File not accessible: {exc}") from exc
 
-    # Reject non-regular files before opening
-    if not stat_module.S_ISREG(pre_stat.st_mode):
-        raise ContractInvalid("Path is not a regular file")
+    # Reject link/reparse and non-regular files before opening
     if stat_module.S_ISLNK(pre_stat.st_mode):
         raise ContractInvalid("Path is a symlink")
+    if not stat_module.S_ISREG(pre_stat.st_mode):
+        raise ContractInvalid("Path is not a regular file")
+    # Check for reparse point
+    if hasattr(pre_stat, "st_file_attributes"):
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        if pre_stat.st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ContractInvalid("Path is a reparse point")
 
     # Size check
     if pre_stat.st_size > max_bytes:
@@ -133,23 +186,37 @@ def _read_regular_file_once_no_follow(path: Path, max_bytes: int) -> bytes:
         if not stat_module.S_ISREG(post_stat.st_mode):
             raise ContractInvalid("File type changed after open")
 
-        # Bounded read loop
+        # Bounded read loop — read to EOF, max max_bytes + 1
         chunks: list[bytes] = []
-        remaining = post_stat.st_size
-        while remaining > 0:
-            chunk_size = min(remaining, 65536)
+        total_read = 0
+        limit = max_bytes + 1
+        while total_read < limit:
+            chunk_size = min(65536, limit - total_read)
             chunk = os.read(fd, chunk_size)
             if not chunk:
                 break
             chunks.append(chunk)
-            remaining -= len(chunk)
+            total_read += len(chunk)
+
+        if total_read > max_bytes:
+            raise ContractInvalid(f"File exceeds size limit during read: {total_read} bytes")
 
         raw = b"".join(chunks)
 
-        # Post-read identity check
+        # Post-read metadata comparison
         post_read_stat = os.fstat(fd)
         if (post_read_stat.st_dev, post_read_stat.st_ino) != (pre_stat.st_dev, pre_stat.st_ino):
             raise ContractInvalid("File identity changed during read")
+        if post_read_stat.st_size != pre_stat.st_size:
+            raise ContractInvalid("File size changed during read")
+        if post_read_stat.st_mtime_ns != pre_stat.st_mtime_ns:
+            raise ContractInvalid("File modified during read")
+        if stat_module.S_ISREG(post_read_stat.st_mode) != stat_module.S_ISREG(pre_stat.st_mode):
+            raise ContractInvalid("File type changed during read")
+
+        # Verify we read all expected bytes
+        if len(raw) != pre_stat.st_size and pre_stat.st_size > 0:
+            raise ContractInvalid("Short read: file bytes changed during collection")
 
         return raw
     finally:
@@ -163,8 +230,8 @@ def _ensure_output_dir(sandbox: Path) -> Path:
     """Create output directory safely — no symlink following."""
     output = sandbox / "output"
     if output.exists():
-        if output.is_symlink():
-            raise ContractInvalid("Output directory is a symlink")
+        if _is_link_or_reparse(output):
+            raise ContractInvalid("Output directory is link/reparse")
         if not output.is_dir():
             raise ContractInvalid("Output path is not a directory")
     else:
@@ -203,6 +270,7 @@ _ERROR_MESSAGES = {
     "candidate_binding_rejected": "Candidate context/profile binding rejected.",
     "candidate_evidence_mismatch": "Candidate evidence digest changed after collection.",
     "candidate_changed_before_collection": "Candidate changed between invoke and collect.",
+    "candidate_changed_during_collection": "Candidate changed during collection read.",
     "sandbox_escape": "Sandbox resolved outside allowed boundary.",
     "sandbox_ref_rejected": "Sandbox reference was rejected.",
     "invalid_request_digest": "Request digest verification failed.",
@@ -229,11 +297,10 @@ class FileBackend:
     ) -> None:
         self._runtime_root_input = Path(runtime_root)
         self._forbidden_root_inputs = tuple(Path(p) for p in forbidden_roots)
-        # Resolve only if the raw path is valid; otherwise store raw for probe()
         self._runtime_root = self._runtime_root_input.resolve()
         self._forbidden_roots = tuple(r.resolve() for r in self._forbidden_root_inputs)
 
-    def _validate_runtime_root_input(self) -> None:
+    def _validate_runtime_root_input(self) -> list[str]:
         """Validate the raw runtime root input. Returns list of error codes."""
         errors: list[str] = []
         raw = self._runtime_root_input
@@ -241,12 +308,27 @@ class FileBackend:
             errors.append("runtime_root_invalid")
         elif not raw.is_dir():
             errors.append("runtime_root_invalid")
-        if raw.is_symlink():
+
+        # Check link/reparse on raw input (before resolve)
+        if _is_link_or_reparse(raw):
             errors.append("runtime_root_link_rejected")
-        for forbidden in self._forbidden_root_inputs:
-            if _paths_overlap(raw, forbidden):
-                errors.append("runtime_root_forbidden")
-                break
+
+        # Check canonical paths for forbidden overlap
+        if not errors:
+            try:
+                runtime_canonical = raw.resolve(strict=True)
+            except (OSError, ValueError):
+                errors.append("runtime_root_invalid")
+            else:
+                for forbidden in self._forbidden_root_inputs:
+                    try:
+                        forbidden_canonical = forbidden.resolve(strict=False)
+                    except (OSError, ValueError):
+                        continue
+                    if _paths_overlap(runtime_canonical, forbidden_canonical):
+                        errors.append("runtime_root_forbidden")
+                        break
+
         return errors
 
     def _assert_runtime_boundary(self) -> None:
@@ -259,9 +341,9 @@ class FileBackend:
         """Probe file backend availability."""
         errors = self._validate_runtime_root_input()
 
-        # Additional writability check (only if basic checks passed)
+        # Additional writability check
         raw = self._runtime_root_input
-        if not errors and raw.exists() and raw.is_dir() and not raw.is_symlink():
+        if not errors and raw.exists() and raw.is_dir() and not _is_link_or_reparse(raw):
             if not os.access(str(raw), os.W_OK):
                 errors.append("runtime_root_unwritable")
 
@@ -297,8 +379,8 @@ class FileBackend:
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
         candidate_path = sandbox / "candidate.json"
 
-        # Check link type first (before exists), to catch dangling symlinks
-        if candidate_path.is_symlink():
+        # Check link type first (before exists), to catch dangling links
+        if _is_link_or_reparse(candidate_path):
             return self._error_result(
                 request, TransportStatus.SANDBOX_VIOLATION,
                 "candidate_symlink_rejected",
@@ -347,20 +429,20 @@ class FileBackend:
             raw_bytes = _read_regular_file_once_no_follow(external_candidate, effective_limit)
         except ContractInvalid as exc:
             msg = str(exc).lower()
-            if "not a regular file" in msg or "symlink" in msg:
+            if "not a regular file" in msg or "symlink" in msg or "reparse" in msg:
                 return self._error_result(
                     request, TransportStatus.SANDBOX_VIOLATION,
                     "candidate_symlink_rejected",
                 )
-            if "too large" in msg:
+            if "too large" in msg or "exceeds size" in msg:
                 return self._error_result(
                     request, TransportStatus.OUTPUT_TOO_LARGE,
                     "candidate_too_large",
                 )
-            if "identity changed" in msg:
+            if "identity changed" in msg or "modified during" in msg or "size changed" in msg or "short read" in msg:
                 return self._error_result(
                     request, TransportStatus.AMBIGUOUS,
-                    "candidate_changed_before_collection",
+                    "candidate_changed_during_collection",
                 )
             if "not accessible" in msg or "no such file" in msg:
                 return self._error_result(

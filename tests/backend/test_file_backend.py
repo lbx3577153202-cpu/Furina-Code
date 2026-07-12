@@ -132,8 +132,16 @@ class TestFileBackendLifecycleRechecks:
 class TestFileBackendSandboxRef:
     def test_absolute_ref_rejected(self, tmp_path):
         fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path, sandbox_path_ref=str(tmp_path / "sandbox"))
+        # Use forward-slash absolute to hit the absolute check (not backslash)
+        req = _make_request(tmp_path, sandbox_path_ref="/tmp/sandbox")
         with pytest.raises(ContractInvalid, match="relative"):
+            fb.prepare(req)
+
+    def test_windows_backslash_rejected(self, tmp_path):
+        """Backslash in ref must be rejected."""
+        fb = FileBackend(tmp_path)
+        req = _make_request(tmp_path, sandbox_path_ref="foo\\bar")
+        with pytest.raises(ContractInvalid, match="forward slashes"):
             fb.prepare(req)
 
     def test_windows_drive_ref_rejected(self, tmp_path):
