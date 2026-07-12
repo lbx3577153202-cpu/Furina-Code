@@ -13,6 +13,7 @@ from furina_code.readonly.file_backend_bridge import (
     build_e4_file_backend_request,
     finalize_e4_file_transport,
 )
+from furina_code.ledger import Ledger
 from tests.e4.conftest import (
     write_candidate_file,
     get_run_binding_id,
@@ -265,3 +266,58 @@ class TestAuthorityBoundary:
         err = json.loads(stderr)
         # Error message should be stable code, not a path
         assert "error" in err
+
+
+class TestCanonicalDigestBinding:
+    def test_canonical_modified_after_collect_fails(self, tmp_path, capsys):
+        """If read_candidate_once returns a digest different from
+        transport.candidate_digest, finalize must fail and must NOT
+        create CandidateEnvelope."""
+        from unittest.mock import patch as mock_patch
+        from furina_code.backend.candidate import (
+            read_candidate_once as _real_read_candidate_once,
+        )
+
+        repo = str(Path(__file__).resolve().parents[2])
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+
+        cli_main(["inspect", "prepare", "--workspace", repo, "--runtime-dir", str(runtime)])
+        cand_path = write_candidate_file(runtime)
+        rb_id = get_run_binding_id(runtime)
+
+        # First finalize succeeds — no monkeypatch
+        exit1 = cli_main(["inspect", "finalize",
+                          "--runtime-dir", str(runtime),
+                          "--run-binding-id", rb_id,
+                          "--candidate-file", cand_path])
+        assert exit1 == 0
+        capsys.readouterr()
+
+        # Second finalize: monkeypatch to return mismatched digest
+        def tampered_read(path):
+            text, parsed, _ = _real_read_candidate_once(path)
+            return text, parsed, "0000" * 16
+
+        with mock_patch(
+            "furina_code.cli.read_candidate_once", tampered_read
+        ):
+            exit2 = cli_main(["inspect", "finalize",
+                              "--runtime-dir", str(runtime),
+                              "--run-binding-id", rb_id,
+                              "--candidate-file", cand_path])
+
+        assert exit2 == 1
+        stderr = capsys.readouterr().err
+        err = json.loads(stderr)
+        assert err["error"] == "CANDIDATE_EVIDENCE_MISMATCH"
+
+        # Must NOT have created a new CandidateEnvelope
+        ledger = Ledger(str(runtime / "inspect.sqlite3"))
+        ledger.open()
+        ce_events = [
+            e for e in ledger.get_verified_events(rb_id)
+            if e["event_type"].startswith("CandidateEnvelope.")
+        ]
+        ledger.close()
+        assert len(ce_events) == 1  # only from first finalize

@@ -549,9 +549,17 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         # Read canonical collected candidate artifact (frozen evidence)
         # The canonical artifact path is deterministic from sandbox_path_ref
         canonical_artifact_path = runtime_dir / transport.candidate_ref
-        cand_text = canonical_artifact_path.read_text(encoding="utf-8")
-        cand_parsed = json.loads(cand_text)
-        cand_digest = transport.candidate_digest
+        cand_text, cand_parsed, cand_raw_hex = read_candidate_once(
+            str(canonical_artifact_path)
+        )
+        cand_digest = f"sha256:{cand_raw_hex}"
+
+        if cand_digest != transport.candidate_digest:
+            print(json.dumps({
+                "error": "CANDIDATE_EVIDENCE_MISMATCH",
+                "message": "Canonical artifact digest does not match transport digest",
+            }), file=sys.stderr)
+            return 1
 
         # Idempotency check using FileBackend canonical digest
         if is_terminal:
