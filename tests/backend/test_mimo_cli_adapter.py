@@ -48,18 +48,34 @@ def _make_adapter(tmp_path, **kwargs):
     return MiMoCodeCLIAdapter(**defaults)
 
 
-def _mock_popen_success(text="OK"):
-    """Factory for MockPopen that returns successful JSON output."""
+def _valid_content(overrides=None):
+    """Return a valid content dict for MiMo output."""
+    c = {
+        "repository_head": "abc123", "branch": "main", "working_tree": "clean",
+        "tracked_file_count": 10, "untracked_file_count": 0,
+        "python_requires": None, "runtime_dependencies": [],
+        "dev_dependencies": [], "pytest_testpaths": [],
+        "ci_config": {"present": False, "sha256": None}, "blind_spots": [],
+    }
+    if overrides:
+        c.update(overrides)
+    return c
+
+
+def _mock_popen_success(content=None):
+    """Factory for MockPopen that returns valid JSON content."""
+    if content is None:
+        content = _valid_content()
+
     class MockPopen:
         def __init__(self, args, **kwargs):
             self.returncode = 0
             self.pid = 99999
             self._stdout_dest = kwargs.get("stdout")
             self._stderr_dest = kwargs.get("stderr")
-            # Write output to file dests (simulating file-based capture)
             if self._stdout_dest:
                 self._stdout_dest.write(
-                    json.dumps({"type": "text", "part": {"text": text}}).encode()
+                    json.dumps({"type": "text", "part": {"text": json.dumps(content)}}).encode()
                     + b"\n"
                 )
                 self._stdout_dest.flush()
@@ -133,7 +149,7 @@ class TestInvoke:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("OK")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
         assert transport.transport_status == TransportStatus.SUCCEEDED.value
@@ -142,7 +158,7 @@ class TestInvoke:
         candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
         assert candidate_path.exists()
         data = json.loads(candidate_path.read_bytes())
-        assert data["content"]["text"] == "OK"
+        assert data["content"]["repository_head"] == "abc123"
 
     def test_candidate_digest_matches_file_bytes(self, tmp_path):
         adapter = _make_adapter(tmp_path)
@@ -150,7 +166,7 @@ class TestInvoke:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("hello")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
         candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
@@ -165,7 +181,7 @@ class TestInvoke:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("persist")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
         candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
@@ -327,7 +343,7 @@ class TestCollect:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("test")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
         result = adapter.collect(plan, transport)
@@ -340,7 +356,7 @@ class TestCollect:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("original")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
         # Tamper the candidate file
@@ -546,7 +562,7 @@ class TestPathContainment:
         plan = adapter.prepare(req)
 
         with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
-                    _mock_popen_success("OK")):
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
         assert transport.transport_status == TransportStatus.SUCCEEDED.value
         assert (tmp_path / "sandbox" / "test" / "candidate.json").exists()

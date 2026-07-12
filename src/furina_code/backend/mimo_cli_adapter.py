@@ -644,28 +644,75 @@ class MiMoCodeCLIAdapter:
     def _build_candidate(
         request: BackendInvocationRequest, text_content: str,
     ) -> dict:
-        """Parse model output as JSON and build candidate with trusted bindings.
+        """Parse model output as strict JSON and build candidate with trusted bindings.
 
-        The model is expected to return a JSON object with content fields.
-        If the model returns raw text, it is parsed as-is into content.text.
-        Trusted bindings (backend_profile_ref, context_ref, etc.) are injected
-        from the verified request, never from model output.
+        The model MUST return a JSON object with valid content fields.
+        Raw text fallback is not allowed — any parse failure is protocol_error.
         """
-        # Try to parse model output as JSON
-        model_content = None
         try:
             parsed = _json.loads(text_content)
-            if isinstance(parsed, dict):
-                model_content = parsed
-        except (_json.JSONDecodeError, ValueError):
-            pass
+        except (_json.JSONDecodeError, ValueError) as exc:
+            raise ContractInvalid(
+                "MIMO_OUTPUT_INVALID_JSON",
+                {"detail": str(exc)},
+            )
 
-        # If model returned valid JSON object, use it as content
-        # Otherwise, wrap raw text
-        if model_content is not None:
-            content = model_content
-        else:
-            content = {"text": text_content}
+        if not isinstance(parsed, dict):
+            raise ContractInvalid(
+                "MIMO_OUTPUT_NOT_OBJECT",
+                {"detail": "Model output must be a JSON object."},
+            )
+
+        # Strict field validation
+        _REQUIRED_CONTENT_FIELDS = {
+            "repository_head": str,
+            "branch": str,
+            "working_tree": str,
+            "tracked_file_count": int,
+            "untracked_file_count": int,
+            "python_requires": (str, type(None)),
+            "runtime_dependencies": list,
+            "dev_dependencies": list,
+            "pytest_testpaths": list,
+            "ci_config": dict,
+            "blind_spots": list,
+        }
+
+        for field, expected_type in _REQUIRED_CONTENT_FIELDS.items():
+            if field not in parsed:
+                raise ContractInvalid(
+                    "MIMO_OUTPUT_MISSING_FIELD",
+                    {"field": field},
+                )
+            if not isinstance(parsed[field], expected_type):
+                raise ContractInvalid(
+                    "MIMO_OUTPUT_WRONG_TYPE",
+                    {"field": field, "expected": expected_type.__name__ if not isinstance(expected_type, tuple) else "/".join(t.__name__ for t in expected_type)},
+                )
+
+        # Validate working_tree value
+        if parsed["working_tree"] not in ("clean", "dirty"):
+            raise ContractInvalid(
+                "MIMO_OUTPUT_INVALID_WORKING_TREE",
+                {"value": parsed["working_tree"]},
+            )
+
+        # Validate ci_config structure
+        ci_config = parsed["ci_config"]
+        if "present" not in ci_config or not isinstance(ci_config["present"], bool):
+            raise ContractInvalid(
+                "MIMO_OUTPUT_INVALID_CI_CONFIG",
+                {"detail": "ci_config must have 'present' (bool)"},
+            )
+
+        # Validate list element types
+        for field in ("runtime_dependencies", "dev_dependencies", "pytest_testpaths", "blind_spots"):
+            for i, item in enumerate(parsed[field]):
+                if not isinstance(item, str):
+                    raise ContractInvalid(
+                        "MIMO_OUTPUT_WRONG_ELEMENT_TYPE",
+                        {"field": field, "index": i},
+                    )
 
         return {
             "schema_version": "1.0",
@@ -674,7 +721,7 @@ class MiMoCodeCLIAdapter:
             "backend_session_ref": request.backend_session_ref,
             "context_ref": request.context_ref,
             "context_digest": request.context_digest,
-            "content": content,
+            "content": parsed,
             "claimed_assumptions": [],
             "requested_actions": [],
         }

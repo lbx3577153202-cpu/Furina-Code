@@ -268,18 +268,34 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         )
         _write_obj(ledger, td, "I2-A", 0)
 
-        # 3. BackendProfile
-        bp = BackendProfile.create(
-            run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
-            project_ref=proj, correlation_id=corr,
-            provider_ref="local-cli",
-            capabilities=("git_read", "file_read"),
-            limits={"max_candidate_bytes": 10_000_000},
-            health="available", credential_mode="none",
-            data_policy_ref="local-only",
-            backend_id="local-cli", backend_kind="local",
-            causation_ref=rb.meta.integrity_ref,
-        )
+        # 3. Determine backend BEFORE creating BackendProfile
+        backend_choice = getattr(args, "backend", "file")
+
+        # 3. BackendProfile (single, based on backend_choice)
+        if backend_choice == "mimo-cli":
+            bp = BackendProfile.create(
+                run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
+                project_ref=proj, correlation_id=corr,
+                provider_ref="mimo-cli",
+                capabilities=("context_read", "text_generation"),
+                limits={"max_candidate_bytes": 10_000_000},
+                health="available", credential_mode="inherited_external",
+                data_policy_ref="snapshot-context-only",
+                backend_id="mimo-cli", backend_kind="external_cli",
+                causation_ref=rb.meta.integrity_ref,
+            )
+        else:
+            bp = BackendProfile.create(
+                run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
+                project_ref=proj, correlation_id=corr,
+                provider_ref="local-cli",
+                capabilities=("git_read", "file_read"),
+                limits={"max_candidate_bytes": 10_000_000},
+                health="available", credential_mode="none",
+                data_policy_ref="local-only",
+                backend_id="local-cli", backend_kind="local",
+                causation_ref=rb.meta.integrity_ref,
+            )
         _write_obj(ledger, bp, "I2-B", 0)
 
         # 4. TaskRun at intake/active — causation_ref = TaskDossier
@@ -335,27 +351,6 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             causation_ref=tr.meta.integrity_ref,
         )
         _write_obj(ledger, cp, "I1-C", 0)
-
-        # Determine backend and create appropriate BackendProfile before closing ledger
-        backend_choice = getattr(args, "backend", "file")
-        if backend_choice == "mimo-cli":
-            bp_mimo = BackendProfile.create(
-                run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
-                project_ref=proj, correlation_id=corr,
-                provider_ref="mimo-cli",
-                capabilities=("context_read", "text_generation"),
-                limits={"max_candidate_bytes": 10_000_000},
-                health="available", credential_mode="inherited_external",
-                data_policy_ref="snapshot-context-only",
-                backend_id="mimo-cli", backend_kind="external_cli",
-                causation_ref=rb.meta.integrity_ref,
-            )
-            _write_obj(ledger, bp_mimo, "I2-B", 0)
-            active_bp_ref = bp_mimo.meta.integrity_ref
-            active_bp_limits = bp_mimo.limits
-        else:
-            active_bp_ref = bp.meta.integrity_ref
-            active_bp_limits = bp.limits
 
         ledger.close()
 
@@ -429,7 +424,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 run_binding_id=rb_id,
                 invocation_id=f"mimo-{tr_id}",
                 backend_session_ref=f"{rb_id}:mimo:{tr_id}",
-                backend_profile_ref=active_bp_ref,
+                backend_profile_ref=bp.meta.integrity_ref,
                 context_ref=ctx.meta.integrity_ref,
                 context_digest=ctx_digest,
                 instruction_text=instruction_text,
@@ -439,7 +434,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 request_digest="",  # placeholder
                 model_ref=None,
                 timeout_seconds=300,
-                max_stdout_bytes=active_bp_limits.get("max_candidate_bytes", 10_000_000),
+                max_stdout_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
                 max_stderr_bytes=1_000_000,
                 fresh_session=True,
                 sandbox_path_ref=request_sandbox_ref,
