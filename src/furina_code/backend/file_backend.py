@@ -10,13 +10,13 @@ All DTOs use relative/logical refs only.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..contracts.errors import ContractInvalid
-from ..contracts.meta import canonical_json_dumps
-from .candidate import MAX_CANDIDATE_BYTES, read_candidate_once, validate_candidate_content
 from .port import (
     BackendInvocationPlan,
     BackendInvocationRequest,
@@ -24,7 +24,6 @@ from .port import (
     BackendProbeResult,
     BackendTransportResult,
     TransportStatus,
-    compute_backend_request_digest,
     compute_empty_args_digest,
     verify_backend_request_digest,
 )
@@ -38,10 +37,24 @@ def _sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+# --- Path validation ---
+
+def _validate_sandbox_ref(sandbox_path_ref: str) -> None:
+    """Reject absolute, traversal, empty, or dot refs before any resolution."""
+    if not sandbox_path_ref:
+        raise ContractInvalid("Sandbox ref must not be empty")
+    ref_path = Path(sandbox_path_ref)
+    if ref_path.is_absolute():
+        raise ContractInvalid("Sandbox ref must be relative")
+    if ".." in ref_path.parts:
+        raise ContractInvalid("Sandbox ref contains traversal")
+    if ref_path == Path("."):
+        raise ContractInvalid("Sandbox ref must not be '.'")
+
+
 def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
     """Resolve sandbox_path_ref against runtime_root. Rejects traversal and escapes."""
-    if ".." in Path(sandbox_path_ref).parts:
-        raise ContractInvalid("Sandbox ref contains traversal")
+    _validate_sandbox_ref(sandbox_path_ref)
 
     resolved = (runtime_root / sandbox_path_ref).resolve()
 
@@ -55,13 +68,57 @@ def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
     current = resolved
     while current != current.parent:
         if current.is_symlink():
-            raise ContractInvalid(f"Path component is symlink: {current.name}")
+            raise ContractInvalid("Sandbox path component is symlink")
         current = current.parent
 
     return resolved
 
 
-# Stable error messages (no paths)
+# --- Safe file reading ---
+
+def _read_regular_file_once_no_follow(path: Path, max_bytes: int) -> bytes:
+    """Read a file using O_NOFOLLOW where possible, bounded read, identity check."""
+    fd = -1
+    try:
+        # Use os.open with O_NOFOLLOW on Unix; on Windows O_NOFOLLOW is ignored
+        # but we already check is_symlink() before calling this
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(path), flags)
+        # fstat to verify identity after open
+        stat = os.fstat(fd)
+        # Verify it's a regular file (S_IFREG)
+        import stat as stat_module
+        if not stat_module.S_ISREG(stat.st_mode):
+            raise ContractInvalid("Path is not a regular file")
+        # Read bounded
+        if stat.st_size > max_bytes:
+            raise ContractInvalid(f"File too large: {stat.st_size} bytes")
+        raw = os.read(fd, stat.st_size)
+        return raw
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+# --- Safe output directory ---
+
+def _ensure_output_dir(sandbox: Path) -> Path:
+    """Create output directory safely — no symlink following."""
+    output = sandbox / "output"
+    if output.exists():
+        if output.is_symlink():
+            raise ContractInvalid("Output directory is a symlink")
+        if not output.is_dir():
+            raise ContractInvalid("Output path is not a directory")
+    else:
+        output.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+# --- Stable error messages (no paths) ---
+
 _ERROR_MESSAGES = {
     "candidate_missing": "Candidate file not found in sandbox.",
     "candidate_path_rejected": "Candidate path was rejected by sandbox policy.",
@@ -71,35 +128,66 @@ _ERROR_MESSAGES = {
     "candidate_protocol_error": "Candidate content is not valid JSON.",
     "candidate_binding_rejected": "Candidate context/profile binding rejected.",
     "candidate_evidence_mismatch": "Candidate evidence digest changed after collection.",
+    "candidate_changed_before_collection": "Candidate changed between invoke and collect.",
     "sandbox_escape": "Sandbox resolved outside allowed boundary.",
     "sandbox_ref_rejected": "Sandbox reference was rejected.",
     "invalid_request_digest": "Request digest verification failed.",
-    "instruction_digest_mismatch": "Instruction text changed after digest computation.",
+    "runtime_root_invalid": "Runtime root is not a valid directory.",
+    "runtime_root_unwritable": "Runtime root is not writable.",
+    "runtime_root_link_rejected": "Runtime root is a symlink or junction.",
+    "runtime_root_forbidden": "Runtime root is in a forbidden directory.",
 }
 
+
+# --- FileBackend ---
 
 class FileBackend:
     """Shadow adapter implementing BackendPort for file-based candidate exchange.
 
     No external executable dependency. No process launch. No Ledger access.
-    runtime_root is瞬时 and never serialized into DTOs.
+    runtime_root and forbidden_roots are瞬时 and never serialized into DTOs.
     """
 
-    def __init__(self, runtime_root: Path) -> None:
+    def __init__(
+        self,
+        runtime_root: Path,
+        forbidden_roots: tuple[Path, ...] = (),
+    ) -> None:
         self._runtime_root = runtime_root.resolve()
+        self._forbidden_roots = tuple(r.resolve() for r in forbidden_roots)
 
     def probe(self, request: BackendProbeRequest) -> BackendProbeResult:
         """Probe file backend availability."""
         errors: list[str] = []
 
-        # Check runtime root
+        # Check runtime root exists and is a directory
         if not self._runtime_root.exists():
             errors.append("runtime_root_invalid")
         elif not self._runtime_root.is_dir():
             errors.append("runtime_root_invalid")
 
-        # Check sandbox ref is relative
-        # (We can't fully validate without a request, but we check runtime root basics)
+        # Check runtime root is not a symlink
+        if self._runtime_root.is_symlink():
+            errors.append("runtime_root_link_rejected")
+
+        # Check runtime root is writable
+        if self._runtime_root.exists() and not os.access(str(self._runtime_root), os.W_OK):
+            errors.append("runtime_root_unwritable")
+
+        # Check runtime root is not inside any forbidden root
+        for forbidden in self._forbidden_roots:
+            try:
+                self._runtime_root.relative_to(forbidden)
+                errors.append("runtime_root_forbidden")
+                break
+            except ValueError:
+                pass
+            # Also check if forbidden is inside runtime_root
+            try:
+                forbidden.relative_to(self._runtime_root)
+                # forbidden is inside runtime_root — that's ok for now
+            except ValueError:
+                pass
 
         return BackendProbeResult(
             available=len(errors) == 0,
@@ -112,14 +200,8 @@ class FileBackend:
 
     def prepare(self, request: BackendInvocationRequest) -> BackendInvocationPlan:
         """Verify request digest, validate sandbox ref, generate plan."""
-        # Verify request digest first (fail-closed)
         verify_backend_request_digest(request)
-
-        # Validate sandbox ref resolution
-        try:
-            _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
-        except ContractInvalid:
-            raise
+        _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
 
         return BackendInvocationPlan(
             request=request,
@@ -132,19 +214,35 @@ class FileBackend:
         )
 
     def invoke(self, plan: BackendInvocationPlan) -> BackendTransportResult:
-        """Check if candidate file exists. Does NOT read content."""
+        """Check if candidate entry exists and is a safe path type. Does NOT read content."""
         request = plan.request
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
         candidate_path = sandbox / "candidate.json"
 
-        # Check existence and basic safety — no content read
-        if not candidate_path.exists():
-            return self._make_result(
-                request, TransportStatus.AWAITING_EXTERNAL,
+        # Check link type first (before exists), to catch dangling symlinks
+        if candidate_path.is_symlink():
+            return self._error_result(
+                request, TransportStatus.SANDBOX_VIOLATION,
+                "candidate_symlink_rejected",
             )
 
-        # Reject symlinks at existence check
-        if candidate_path.is_symlink():
+        # Check if it's a junction/reparse point
+        if hasattr(os, "FILE_ATTRIBUTE_REPARSE_POINT") and candidate_path.exists():
+            try:
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(candidate_path))
+                if attrs & os.FILE_ATTRIBUTE_REPARSE_POINT:
+                    return self._error_result(
+                        request, TransportStatus.SANDBOX_VIOLATION,
+                        "candidate_symlink_rejected",
+                    )
+            except Exception:
+                pass  # Not Windows or ctypes unavailable
+
+        if not candidate_path.exists():
+            return self._make_result(request, TransportStatus.AWAITING_EXTERNAL)
+
+        # Must be a regular file
+        if not candidate_path.is_file():
             return self._error_result(
                 request, TransportStatus.SANDBOX_VIOLATION,
                 "candidate_symlink_rejected",
@@ -157,83 +255,82 @@ class FileBackend:
         plan: BackendInvocationPlan,
         transport: BackendTransportResult,
     ) -> BackendTransportResult:
-        """Read external candidate once and form canonical collected artifact."""
+        """Read external candidate once, form canonical artifact. Protocol-neutral."""
         if transport.transport_status != TransportStatus.SUCCEEDED.value:
             return transport
 
         request = plan.request
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
         external_candidate = sandbox / "candidate.json"
-        output_dir = sandbox / "output"
-        output_dir.mkdir(exist_ok=True)
-        canonical_candidate = output_dir / "collected_candidate.json"
+        output_dir = _ensure_output_dir(sandbox)
+
+        # Compute relative candidate_ref from sandbox_path_ref
+        sandbox_ref = request.sandbox_path_ref
+        candidate_ref = f"{sandbox_ref}/output/collected_candidate.json"
 
         # Check effective size limit
-        effective_limit = min(request.max_stdout_bytes, MAX_CANDIDATE_BYTES)
+        effective_limit = min(request.max_stdout_bytes, 10 * 1024 * 1024)  # 10 MB
         if effective_limit <= 0:
-            return self._error_result(
+            result = self._error_result(
                 request, TransportStatus.OUTPUT_TOO_LARGE,
                 "candidate_too_large",
             )
+            return result
 
-        # Single read of external candidate
+        # Safe single read — no-follow, bounded, identity check
         try:
-            raw_bytes = external_candidate.read_bytes()
+            raw_bytes = _read_regular_file_once_no_follow(external_candidate, effective_limit)
+        except ContractInvalid as exc:
+            msg = str(exc).lower()
+            if "not a regular file" in msg or "symlink" in msg:
+                return self._error_result(
+                    request, TransportStatus.SANDBOX_VIOLATION,
+                    "candidate_symlink_rejected",
+                )
+            if "too large" in msg:
+                return self._error_result(
+                    request, TransportStatus.OUTPUT_TOO_LARGE,
+                    "candidate_too_large",
+                )
+            return self._error_result(
+                request, TransportStatus.CANDIDATE_REJECTED,
+                "candidate_missing",
+            )
+        except FileNotFoundError:
+            # Candidate disappeared between invoke and collect
+            return self._error_result(
+                request, TransportStatus.AMBIGUOUS,
+                "candidate_changed_before_collection",
+            )
         except OSError:
             return self._error_result(
                 request, TransportStatus.CANDIDATE_REJECTED,
                 "candidate_missing",
             )
 
-        # Size check
-        if len(raw_bytes) > effective_limit:
-            return self._error_result(
-                request, TransportStatus.OUTPUT_TOO_LARGE,
-                "candidate_too_large",
-            )
-
-        # UTF-8 decode (strict)
-        try:
-            text = raw_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            return self._error_result(
-                request, TransportStatus.INVALID_UTF8,
-                "candidate_invalid_utf8",
-            )
-
-        # JSON parse
-        import json
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return self._error_result(
-                request, TransportStatus.PROTOCOL_ERROR,
-                "candidate_protocol_error",
-            )
-
-        if not isinstance(parsed, dict):
-            return self._error_result(
-                request, TransportStatus.PROTOCOL_ERROR,
-                "candidate_protocol_error",
-            )
-
-        # Compute digest from the exact bytes we read
+        # Compute digest from raw bytes (protocol-neutral — no UTF-8/JSON here)
         candidate_digest = _sha256_bytes(raw_bytes)
 
-        # Write canonical collected artifact (atomic-ish: exclusive create)
-        if canonical_candidate.exists():
-            # If artifact already exists from a different invocation, this is a problem
-            existing_bytes = canonical_candidate.read_bytes()
-            if _sha256_bytes(existing_bytes) != candidate_digest:
+        # Write canonical artifact with exclusive create
+        canonical_path = output_dir / "collected_candidate.json"
+        try:
+            # O_CREAT | O_EXCL — fails if file already exists
+            fd = os.open(str(canonical_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            os.write(fd, raw_bytes)
+            os.close(fd)
+        except FileExistsError:
+            # Artifact already exists — verify it's the same evidence
+            existing_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
+            existing_digest = _sha256_bytes(existing_bytes)
+            if existing_digest != candidate_digest:
                 return self._error_result(
                     request, TransportStatus.AMBIGUOUS,
                     "candidate_evidence_mismatch",
                 )
-        else:
-            canonical_candidate.write_bytes(raw_bytes)
+            # Same digest — idempotent reuse, continue
 
-        # Verify canonical artifact matches what we just wrote
-        canonical_bytes = canonical_candidate.read_bytes()
+        # Verify canonical artifact digest
+        canonical_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
         canonical_digest = _sha256_bytes(canonical_bytes)
         if canonical_digest != candidate_digest:
             return self._error_result(
@@ -241,24 +338,14 @@ class FileBackend:
                 "candidate_evidence_mismatch",
             )
 
-        return BackendTransportResult(
-            invocation_id=transport.invocation_id,
-            request_digest=transport.request_digest,
-            backend_session_ref=transport.backend_session_ref,
-            provider_session_ref=None,
-            provider_ref="file-backend",
-            executable_version="file-backend-1.0",
-            started_at=transport.started_at,
-            finished_at=_now_iso(),
-            command_args_digest=compute_empty_args_digest(),
-            stdout_ref=None, stdout_digest=None, stdout_bytes=0, stdout_truncated=False,
-            stderr_ref=None, stderr_digest=None, stderr_bytes=0, stderr_truncated=False,
-            candidate_ref="output/collected_candidate.json",
+        return dataclasses.replace(
+            transport,
+            candidate_ref=candidate_ref,
             candidate_digest=candidate_digest,
-            manifest_before_ref=None, manifest_before_digest=None,
-            manifest_after_ref=None, manifest_after_digest=None,
+            finished_at=_now_iso(),
             transport_status=TransportStatus.SUCCEEDED.value,
-            error_code=None, error_detail=None,
+            error_code=None,
+            error_detail=None,
         )
 
     def strict_validate(
@@ -271,41 +358,54 @@ class FileBackend:
             return transport
 
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
-        canonical_candidate = sandbox / "output" / "collected_candidate.json"
+        canonical_path = sandbox / "output" / "collected_candidate.json"
 
-        if not canonical_candidate.exists():
-            return self._error_result(
-                request, TransportStatus.AMBIGUOUS,
-                "candidate_evidence_mismatch",
+        if not canonical_path.exists():
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+                finished_at=_now_iso(),
             )
 
-        # Read canonical artifact (the frozen evidence)
+        # Read canonical artifact (frozen evidence)
         try:
-            raw_bytes = canonical_candidate.read_bytes()
-        except OSError:
-            return self._error_result(
-                request, TransportStatus.AMBIGUOUS,
-                "candidate_evidence_mismatch",
+            raw_bytes = _read_regular_file_once_no_follow(canonical_path, 10 * 1024 * 1024)
+        except Exception:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+                finished_at=_now_iso(),
             )
 
-        # Verify digest matches transport
+        # Verify canonical digest matches transport
         canonical_digest = _sha256_bytes(raw_bytes)
         if canonical_digest != transport.candidate_digest:
-            return self._error_result(
-                request, TransportStatus.AMBIGUOUS,
-                "candidate_evidence_mismatch",
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+                finished_at=_now_iso(),
             )
 
         # Strict UTF-8 decode
         try:
             text = raw_bytes.decode("utf-8")
         except UnicodeDecodeError:
-            return self._error_result(
-                request, TransportStatus.INVALID_UTF8,
-                "candidate_invalid_utf8",
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.INVALID_UTF8.value,
+                error_code="candidate_invalid_utf8",
+                error_detail=_ERROR_MESSAGES["candidate_invalid_utf8"],
+                finished_at=_now_iso(),
             )
 
         # Validate content against request bindings
+        from .candidate import validate_candidate_content
         try:
             validate_candidate_content(
                 text,
@@ -315,25 +415,12 @@ class FileBackend:
             )
         except ContractInvalid as exc:
             status = _map_candidate_error(exc)
-            return BackendTransportResult(
-                invocation_id=transport.invocation_id,
-                request_digest=transport.request_digest,
-                backend_session_ref=transport.backend_session_ref,
-                provider_session_ref=transport.provider_session_ref,
-                provider_ref=transport.provider_ref,
-                executable_version=transport.executable_version,
-                started_at=transport.started_at,
-                finished_at=_now_iso(),
-                command_args_digest=transport.command_args_digest,
-                stdout_ref=None, stdout_digest=None, stdout_bytes=0, stdout_truncated=False,
-                stderr_ref=None, stderr_digest=None, stderr_bytes=0, stderr_truncated=False,
-                candidate_ref=transport.candidate_ref,
-                candidate_digest=transport.candidate_digest,
-                manifest_before_ref=None, manifest_before_digest=None,
-                manifest_after_ref=None, manifest_after_digest=None,
+            return dataclasses.replace(
+                transport,
                 transport_status=status.value,
                 error_code=_map_error_code(exc),
                 error_detail=_ERROR_MESSAGES.get(_map_error_code(exc), "Validation failed."),
+                finished_at=_now_iso(),
             )
 
         return transport
@@ -343,6 +430,7 @@ class FileBackend:
         request: BackendInvocationRequest,
         status: TransportStatus,
     ) -> BackendTransportResult:
+        sandbox_ref = request.sandbox_path_ref
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
@@ -368,6 +456,7 @@ class FileBackend:
         status: TransportStatus,
         error_code: str,
     ) -> BackendTransportResult:
+        sandbox_ref = request.sandbox_path_ref
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
@@ -431,3 +520,10 @@ def _map_error_code(exc: ContractInvalid) -> str:
     if "empty" in msg:
         return "candidate_missing"
     return "candidate_protocol_error"
+
+
+# Conditional import for Windows reparse point detection
+try:
+    import ctypes
+except ImportError:
+    ctypes = None  # type: ignore[assignment]
