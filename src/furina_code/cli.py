@@ -150,6 +150,12 @@ def _write_obj(ledger: Ledger, obj, caller_organ: str, expected_revision: int) -
     ledger.write_object(obj.meta, _payload_from_obj(obj), caller_organ, expected_revision)
 
 
+def _instruction_profile_ref_hash(instruction_profile: dict) -> str:
+    """Compute a deterministic SHA-256 ref from the instruction profile dict."""
+    raw = canonical_json_dumps(instruction_profile).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def _validate_raw_path(path: str, label: str) -> None:
     """Reject raw CLI path arguments containing traversal before any resolve."""
     if ".." in Path(path).parts:
@@ -336,26 +342,96 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ctx_path = str(runtime_dir / "context_packet.json")
         ctx_digest = write_context_packet(ctx, ctx_path)
 
-        # Wire to FileBackend — probe, prepare, invoke
+        # Wire to selected backend adapter
         request_sandbox_ref = f"backend/{rb_id}/{tr_id}"
-        try:
-            transport, candidate_drop_path = prepare_e4_file_transport(
-                runtime_dir=runtime_dir,
-                repository_root=repository_root,
+        backend_choice = getattr(args, "backend", "file")
+
+        if backend_choice == "mimo-cli":
+            from .backend.mimo_cli_adapter import MiMoCodeCLIAdapter
+            from .backend.port import (
+                BackendProbeRequest, BackendInvocationRequest,
+                compute_backend_request_digest,
+            )
+            from dataclasses import replace
+
+            adapter = MiMoCodeCLIAdapter(
+                runtime_root=runtime_dir,
+                forbidden_roots=(repository_root,),
+            )
+
+            # Probe
+            probe = adapter.probe(BackendProbeRequest(
+                executable_ref="mimo", probe_timeout_seconds=10,
+            ))
+            if not probe.available:
+                print(json.dumps({
+                    "error": "BACKEND_UNAVAILABLE",
+                    "message": f"MiMo backend unavailable: {', '.join(probe.errors)}",
+                }), file=sys.stderr)
+                return 1
+
+            # Build request
+            instruction_profile_ref = _instruction_profile_ref_hash(ctx.instruction_profile)
+            mimo_request = BackendInvocationRequest(
                 run_binding_id=rb_id,
-                task_run_id=tr_id,
+                invocation_id=f"mimo-{tr_id}",
+                backend_session_ref=f"{rb_id}:mimo:{tr_id}",
                 backend_profile_ref=bp.meta.integrity_ref,
                 context_ref=ctx.meta.integrity_ref,
                 context_digest=ctx_digest,
-                instruction_profile=ctx.instruction_profile,
-                max_candidate_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
+                instruction_text="Generate a repository baseline report as JSON.",
+                instruction_profile_ref=instruction_profile_ref,
+                config_ref="e4:mimo-cli:v1",
+                sandbox_policy_ref="trusted-runtime-only:v1",
+                request_digest="",  # placeholder
+                model_ref=None,
+                timeout_seconds=300,
+                max_stdout_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
+                max_stderr_bytes=1_000_000,
+                fresh_session=True,
+                sandbox_path_ref=request_sandbox_ref,
             )
-        except ContractInvalid as fb_exc:
-            print(json.dumps({
-                "error": fb_exc.code,
-                "message": fb_exc.message,
-            }), file=sys.stderr)
-            return 1
+            mimo_request = replace(
+                mimo_request,
+                request_digest=compute_backend_request_digest(mimo_request),
+            )
+
+            plan = adapter.prepare(mimo_request)
+            transport = adapter.invoke(plan)
+            transport = adapter.collect(plan, transport)
+            transport = adapter.strict_validate(mimo_request, transport)
+
+            if transport.transport_status != "succeeded":
+                print(json.dumps({
+                    "error": "BACKEND_FAILED",
+                    "message": f"MiMo backend failed: {transport.error_code} — {transport.error_detail}",
+                }), file=sys.stderr)
+                return 1
+
+            candidate_drop_path = str(
+                runtime_dir / request_sandbox_ref / "candidate.json"
+            )
+
+        else:
+            # Default: FileBackend path
+            try:
+                transport, candidate_drop_path = prepare_e4_file_transport(
+                    runtime_dir=runtime_dir,
+                    repository_root=repository_root,
+                    run_binding_id=rb_id,
+                    task_run_id=tr_id,
+                    backend_profile_ref=bp.meta.integrity_ref,
+                    context_ref=ctx.meta.integrity_ref,
+                    context_digest=ctx_digest,
+                    instruction_profile=ctx.instruction_profile,
+                    max_candidate_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
+                )
+            except ContractInvalid as fb_exc:
+                print(json.dumps({
+                    "error": fb_exc.code,
+                    "message": fb_exc.message,
+                }), file=sys.stderr)
+                return 1
 
         output = {
             "run_binding_id": rb_id,
@@ -946,6 +1022,8 @@ def main(argv: list[str] | None = None) -> int:
     prep = inspect_sub.add_parser("prepare", help="Prepare read-only inspection")
     prep.add_argument("--workspace", required=True, help="Path to git repository")
     prep.add_argument("--runtime-dir", required=True, help="Path to runtime directory")
+    prep.add_argument("--backend", default="file", choices=["file", "mimo-cli"],
+                       help="Backend adapter to use (default: file)")
     prep.set_defaults(func=cmd_prepare)
 
     fin = inspect_sub.add_parser("finalize", help="Finalize with candidate file")
