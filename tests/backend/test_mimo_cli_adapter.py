@@ -453,6 +453,152 @@ class TestAuthorityBoundary:
         assert repo_path not in plan.env_policy_ref
 
 
+class TestPathContainment:
+    def test_rejects_absolute_ref(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="/etc/passwd")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_rejects_traversal_ref(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="../escape")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_rejects_empty_ref(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_rejects_runtime_in_forbidden_root(self, tmp_path):
+        forbidden = tmp_path / "forbidden"
+        forbidden.mkdir()
+        inner = forbidden / "child"
+        inner.mkdir()
+        adapter = _make_adapter(inner, forbidden_roots=(forbidden,))
+        req = _make_request(sandbox_path_ref="sandbox/test")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_rejects_ref_in_forbidden_root(self, tmp_path):
+        forbidden = tmp_path / "forbidden"
+        forbidden.mkdir()
+        adapter = _make_adapter(forbidden, forbidden_roots=(forbidden,))
+        req = _make_request(sandbox_path_ref="sandbox/test")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_normal_relative_sandbox_succeeds(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="sandbox/test")
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("OK")):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SUCCEEDED.value
+        assert (tmp_path / "sandbox" / "test" / "candidate.json").exists()
+
+    def test_no_file_outside_runtime_root(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="../outside/leaked.json")
+        plan = adapter.prepare(req)
+
+        class MockPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+            transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+        assert not (outside / "leaked.json").exists()
+
+    def test_collect_rejects_bad_path(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="sandbox/test")
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
+        # Create a plan with bad ref for collect
+        bad_req = _make_request(sandbox_path_ref="../escape")
+        bad_plan = adapter.prepare(bad_req)
+        result = adapter.collect(bad_plan, transport)
+        assert result.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_strict_validate_rejects_bad_path(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(sandbox_path_ref="sandbox/test")
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
+        bad_req = _make_request(sandbox_path_ref="../escape")
+        result = adapter.strict_validate(bad_req, transport)
+        assert result.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+
 class TestRealMiMoShadowSmoke:
     @pytest.mark.skipif(
         os.environ.get("MIMO_SMOKE_TEST") != "1",

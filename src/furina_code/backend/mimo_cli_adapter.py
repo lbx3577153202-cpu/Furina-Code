@@ -26,6 +26,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..contracts.errors import ContractInvalid
 from .port import (
     BackendInvocationPlan,
     BackendInvocationRequest,
@@ -141,6 +142,15 @@ class MiMoCodeCLIAdapter:
 
     def invoke(self, plan: BackendInvocationPlan) -> BackendTransportResult:
         request = plan.request
+
+        # Validate candidate path BEFORE launching process
+        try:
+            self._resolve_candidate_path(request)
+        except ContractInvalid:
+            return self._error_result(
+                request, TransportStatus.SANDBOX_VIOLATION,
+                "sandbox_violation",
+            )
 
         # Create fresh temp CWD
         temp_cwd = Path(tempfile.mkdtemp(prefix="furina_mimo_"))
@@ -339,7 +349,19 @@ class MiMoCodeCLIAdapter:
         candidate = self._build_candidate(request, text_content)
         candidate_bytes = _json.dumps(candidate, ensure_ascii=False).encode("utf-8")
 
-        candidate_path = self._resolve_candidate_path(request)
+        try:
+            candidate_path = self._resolve_candidate_path(request)
+        except ContractInvalid as exc:
+            return self._make_result(
+                request,
+                transport_status=TransportStatus.SANDBOX_VIOLATION.value,
+                error_code="sandbox_violation",
+                error_detail=str(exc),
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
+            )
         try:
             candidate_path.parent.mkdir(parents=True, exist_ok=True)
             candidate_path.write_bytes(candidate_bytes)
@@ -378,7 +400,16 @@ class MiMoCodeCLIAdapter:
             return transport
 
         request = plan.request
-        candidate_path = self._resolve_candidate_path(request)
+        try:
+            candidate_path = self._resolve_candidate_path(request)
+        except ContractInvalid:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.SANDBOX_VIOLATION.value,
+                error_code="sandbox_violation",
+                error_detail="Invalid candidate path.",
+                finished_at=_now_iso(),
+            )
 
         if not candidate_path.exists():
             return dataclasses.replace(
@@ -439,7 +470,16 @@ class MiMoCodeCLIAdapter:
             )
 
         # Re-read the persisted candidate and verify
-        candidate_path = self._resolve_candidate_path(request)
+        try:
+            candidate_path = self._resolve_candidate_path(request)
+        except ContractInvalid:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.SANDBOX_VIOLATION.value,
+                error_code="sandbox_violation",
+                error_detail="Invalid candidate path during validation.",
+                finished_at=_now_iso(),
+            )
         if not candidate_path.exists():
             return dataclasses.replace(
                 transport,
@@ -475,8 +515,42 @@ class MiMoCodeCLIAdapter:
     # --- Internal helpers ---
 
     def _resolve_candidate_path(self, request: BackendInvocationRequest) -> Path:
-        sandbox = self._runtime_root / request.sandbox_path_ref
-        return sandbox / "candidate.json"
+        ref = request.sandbox_path_ref
+        if not ref:
+            raise ContractInvalid("Sandbox path ref must not be empty.")
+        relative_ref = Path(ref)
+        if relative_ref.is_absolute() or ".." in relative_ref.parts:
+            raise ContractInvalid(
+                "MIMO_SANDBOX_PATH_INVALID",
+                {"sandbox_path_ref": ref},
+            )
+
+        runtime_root = self._runtime_root.resolve()
+        sandbox = (runtime_root / relative_ref).resolve()
+        candidate = (sandbox / "candidate.json").resolve()
+
+        # Candidate must be inside runtime_root
+        try:
+            candidate.relative_to(runtime_root)
+        except ValueError:
+            raise ContractInvalid(
+                "MIMO_SANDBOX_PATH_ESCAPE",
+                {"candidate": str(candidate), "runtime_root": str(runtime_root)},
+            )
+
+        # Candidate must not be inside any forbidden root
+        for forbidden in self._forbidden_roots:
+            forbidden_resolved = forbidden.resolve()
+            try:
+                candidate.relative_to(forbidden_resolved)
+            except ValueError:
+                continue
+            raise ContractInvalid(
+                "MIMO_SANDBOX_FORBIDDEN_ROOT",
+                {"candidate": str(candidate), "forbidden": str(forbidden_resolved)},
+            )
+
+        return candidate
 
     @staticmethod
     def _kill_process_tree(proc: subprocess.Popen) -> None:
