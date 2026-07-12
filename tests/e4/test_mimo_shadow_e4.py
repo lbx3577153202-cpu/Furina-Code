@@ -80,42 +80,155 @@ class TestMimoRequiresExplicitOptIn:
 
 
 class TestMimoMockIntegration:
-    def test_mimo_mock_prepare_finalize_loop(self, tmp_path, capsys):
-        """Mock MiMo adapter through prepare -> finalize loop."""
+    def test_mimo_mock_closed_loop(self, tmp_path, capsys):
+        """Mock MiMo returning structured JSON through full prepare -> finalize loop."""
         from furina_code.backend.mimo_cli_adapter import MiMoCodeCLIAdapter
-        from furina_code.backend.port import TransportStatus
+        from furina_code.backend.port import (
+            BackendProbeResult, BackendTransportResult,
+            TransportStatus, compute_empty_args_digest,
+        )
+        from furina_code.contracts.meta import canonical_json_dumps
+        import hashlib
+        from datetime import datetime, timezone
 
         repo = str(Path(__file__).resolve().parents[2])
         runtime = tmp_path / "runtime"
         runtime.mkdir()
 
-        # Mock probe to return available
-        class MockProbe:
-            available = True
-            version = "mock-1.0"
-            executable_ref = "mimo"
-            supported_flags = ()
-            model_ids = ()
-            errors = ()
+        # The structured JSON MiMo should return
+        mimo_response = {
+            "repository_head": "abc123def456",
+            "branch": "main",
+            "working_tree": "clean",
+            "tracked_file_count": 42,
+            "untracked_file_count": 3,
+            "python_requires": ">=3.12",
+            "runtime_dependencies": ["click"],
+            "dev_dependencies": ["pytest"],
+            "pytest_testpaths": ["tests"],
+            "ci_config": {"present": True, "sha256": "abc123"},
+            "blind_spots": ["file contents not inspected"],
+        }
 
-        original_invoke = MiMoCodeCLIAdapter.invoke
+        # Build the candidate that the adapter would write
+        candidate = {
+            "schema_version": "1.0",
+            "candidate_type": "repository_baseline_report",
+            "backend_profile_ref": "sha256:mock_bp",
+            "backend_session_ref": "mock_session",
+            "context_ref": "sha256:mock_ctx",
+            "context_digest": "sha256:mock_cd",
+            "content": mimo_response,
+            "claimed_assumptions": [],
+            "requested_actions": [],
+        }
+        candidate_bytes = json.dumps(candidate, ensure_ascii=False).encode("utf-8")
+        candidate_digest = "sha256:" + hashlib.sha256(candidate_bytes).hexdigest()
+
+        mock_probe = BackendProbeResult(
+            available=True, version="mock-1.0", executable_ref="mimo",
+            supported_flags=(), model_ids=(), errors=(),
+        )
+
+        # Mock the full adapter lifecycle to return successful results
+        def mock_prepare(self, request):
+            from furina_code.backend.port import BackendInvocationPlan, compute_backend_request_digest
+            verify_digest = compute_backend_request_digest(request)
+            return BackendInvocationPlan(
+                request=request,
+                executable_args=("mimo", "run", "--format", "json"),
+                cwd_ref=request.sandbox_path_ref,
+                env_policy_ref="mimo-cli:inherit",
+                env_key_allowlist=(),
+                credential_mode="inherit",
+                provider_state_policy_ref="mimo-cli:fresh-session",
+            )
 
         def mock_invoke(self, plan):
-            transport = original_invoke(self, plan)
-            if transport.transport_status == TransportStatus.SUCCEEDED.value:
-                return transport
-            return transport
+            request = plan.request
+            now = datetime.now(timezone.utc).isoformat()
+            # Write candidate to sandbox
+            sandbox = self._runtime_root / request.sandbox_path_ref
+            candidate_path = sandbox / "candidate.json"
+            candidate_local = {
+                "schema_version": "1.0",
+                "candidate_type": "repository_baseline_report",
+                "backend_profile_ref": request.backend_profile_ref,
+                "backend_session_ref": request.backend_session_ref,
+                "context_ref": request.context_ref,
+                "context_digest": request.context_digest,
+                "content": mimo_response,
+                "claimed_assumptions": [],
+                "requested_actions": [],
+            }
+            candidate_local_bytes = json.dumps(candidate_local, ensure_ascii=False).encode("utf-8")
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+            candidate_path.write_bytes(candidate_local_bytes)
+            return BackendTransportResult(
+                invocation_id=request.invocation_id,
+                request_digest=request.request_digest,
+                backend_session_ref=request.backend_session_ref,
+                provider_session_ref="mock_session_123",
+                provider_ref="mimo-cli",
+                executable_version="mimo-cli-1.0",
+                started_at=now, finished_at=now,
+                command_args_digest=compute_empty_args_digest(),
+                stdout_ref=None,
+                stdout_digest="sha256:" + "aa" * 32,
+                stdout_bytes=100, stdout_truncated=False,
+                stderr_ref=None,
+                stderr_digest=None,
+                stderr_bytes=0, stderr_truncated=False,
+                candidate_ref=f"{request.sandbox_path_ref}/candidate.json",
+                candidate_digest="sha256:" + hashlib.sha256(candidate_local_bytes).hexdigest(),
+                manifest_before_ref=None, manifest_before_digest=None,
+                manifest_after_ref=None, manifest_after_digest=None,
+                transport_status=TransportStatus.SUCCEEDED.value,
+                error_code=None, error_detail=None,
+            )
 
-        # Patch probe to always succeed
-        with patch.object(MiMoCodeCLIAdapter, "probe", return_value=MockProbe()):
-            # Write a candidate file at the expected location
-            # First prepare with mimo-cli backend (will fail at invoke)
-            exit_code = cli_main(["inspect", "prepare",
-                                  "--workspace", repo,
-                                  "--runtime-dir", str(runtime),
-                                  "--backend", "mimo-cli"])
-            # Expected to fail since mock doesn't produce real output
-            assert exit_code == 1
+        with patch.object(MiMoCodeCLIAdapter, "probe", return_value=mock_probe):
+            with patch.object(MiMoCodeCLIAdapter, "prepare", mock_prepare):
+                with patch.object(MiMoCodeCLIAdapter, "invoke", mock_invoke):
+                    exit_code = cli_main(["inspect", "prepare",
+                                          "--workspace", repo,
+                                          "--runtime-dir", str(runtime),
+                                          "--backend", "mimo-cli"])
+
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        output = json.loads(captured.out.splitlines()[-1])
+        assert output["backend_transport_status"] == "succeeded"
+
+        # Candidate should exist at deterministic path
+        candidate_path = Path(output["candidate_drop_path"])
+        assert candidate_path.exists()
+
+        # Candidate should have proper content fields
+        candidate_data = json.loads(candidate_path.read_text(encoding="utf-8"))
+        assert candidate_data["schema_version"] == "1.0"
+        assert candidate_data["candidate_type"] == "repository_baseline_report"
+        assert candidate_data["content"]["repository_head"] == "abc123def456"
+        assert candidate_data["content"]["branch"] == "main"
+        assert candidate_data["content"]["tracked_file_count"] == 42
+
+        # Finalize should consume this candidate
+        rb_id = output["run_binding_id"]
+        exit_code = cli_main(["inspect", "finalize",
+                              "--runtime-dir", str(runtime),
+                              "--run-binding-id", rb_id,
+                              "--candidate-file", str(candidate_path)])
+        assert exit_code == 0
+
+        # Verify CompletionVerdict and VerificationVerdict exist
+        ledger = Ledger(str(runtime / "inspect.sqlite3"))
+        ledger.open()
+        events = ledger.get_verified_events(rb_id)
+        cv_events = [e for e in events if e["event_type"].startswith("CompletionVerdict.")]
+        vv_events = [e for e in events if e["event_type"].startswith("VerificationVerdict.")]
+        ledger.close()
+        assert len(cv_events) >= 1
+        assert len(vv_events) >= 1
 
 
 class TestAuthorityBoundary:

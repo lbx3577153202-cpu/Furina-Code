@@ -644,20 +644,37 @@ class MiMoCodeCLIAdapter:
     def _build_candidate(
         request: BackendInvocationRequest, text_content: str,
     ) -> dict:
+        """Parse model output as JSON and build candidate with trusted bindings.
+
+        The model is expected to return a JSON object with content fields.
+        If the model returns raw text, it is parsed as-is into content.text.
+        Trusted bindings (backend_profile_ref, context_ref, etc.) are injected
+        from the verified request, never from model output.
+        """
+        # Try to parse model output as JSON
+        model_content = None
+        try:
+            parsed = _json.loads(text_content)
+            if isinstance(parsed, dict):
+                model_content = parsed
+        except (_json.JSONDecodeError, ValueError):
+            pass
+
+        # If model returned valid JSON object, use it as content
+        # Otherwise, wrap raw text
+        if model_content is not None:
+            content = model_content
+        else:
+            content = {"text": text_content}
+
         return {
             "schema_version": "1.0",
-            "candidate_type": "mimo_cli_response",
+            "candidate_type": "repository_baseline_report",
             "backend_profile_ref": request.backend_profile_ref,
             "backend_session_ref": request.backend_session_ref,
             "context_ref": request.context_ref,
             "context_digest": request.context_digest,
-            "content": {
-                "text": text_content,
-                "model_ref": request.model_ref,
-                "instruction_text_hash": hashlib.sha256(
-                    request.instruction_text.encode("utf-8")
-                ).hexdigest(),
-            },
+            "content": content,
             "claimed_assumptions": [],
             "requested_actions": [],
         }

@@ -336,6 +336,27 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         )
         _write_obj(ledger, cp, "I1-C", 0)
 
+        # Determine backend and create appropriate BackendProfile before closing ledger
+        backend_choice = getattr(args, "backend", "file")
+        if backend_choice == "mimo-cli":
+            bp_mimo = BackendProfile.create(
+                run_binding_id=rb_id, task_id=task_id, task_run_id=tr_id,
+                project_ref=proj, correlation_id=corr,
+                provider_ref="mimo-cli",
+                capabilities=("context_read", "text_generation"),
+                limits={"max_candidate_bytes": 10_000_000},
+                health="available", credential_mode="inherited_external",
+                data_policy_ref="snapshot-context-only",
+                backend_id="mimo-cli", backend_kind="external_cli",
+                causation_ref=rb.meta.integrity_ref,
+            )
+            _write_obj(ledger, bp_mimo, "I2-B", 0)
+            active_bp_ref = bp_mimo.meta.integrity_ref
+            active_bp_limits = bp_mimo.limits
+        else:
+            active_bp_ref = bp.meta.integrity_ref
+            active_bp_limits = bp.limits
+
         ledger.close()
 
         # Write context packet
@@ -344,13 +365,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
         # Wire to selected backend adapter
         request_sandbox_ref = f"backend/{rb_id}/{tr_id}"
-        backend_choice = getattr(args, "backend", "file")
 
         if backend_choice == "mimo-cli":
             from .backend.mimo_cli_adapter import MiMoCodeCLIAdapter
             from .backend.port import (
                 BackendProbeRequest, BackendInvocationRequest,
-                compute_backend_request_digest,
+                compute_backend_request_digest as _compute_req_digest,
             )
             from dataclasses import replace
 
@@ -370,30 +390,63 @@ def cmd_prepare(args: argparse.Namespace) -> int:
                 }), file=sys.stderr)
                 return 1
 
-            # Build request
+            # Build real instruction with snapshot context
+            snap_summary = ctx.context_payload.get("snapshot_summary", {})
+            instruction_text = (
+                "You are a repository analysis assistant. "
+                "Given the following repository snapshot data, generate a structured "
+                "repository baseline report as a single JSON object.\n\n"
+                "The JSON object must contain exactly these fields:\n"
+                "- repository_head: the HEAD commit SHA (string)\n"
+                "- branch: the current branch name (string)\n"
+                "- working_tree: 'clean' or 'dirty' (string)\n"
+                "- tracked_file_count: number of tracked files (integer)\n"
+                "- untracked_file_count: number of untracked files (integer)\n"
+                "- python_requires: Python version requirement or null (string or null)\n"
+                "- runtime_dependencies: list of runtime dependency names (list of strings)\n"
+                "- dev_dependencies: list of dev dependency names (list of strings)\n"
+                "- pytest_testpaths: list of test paths (list of strings)\n"
+                "- ci_config: object with 'present' (bool) and 'sha256' (string or null)\n"
+                "- blind_spots: list of observation limitations (list of strings)\n\n"
+                "Repository snapshot data:\n"
+                f"- HEAD SHA: {snap_summary.get('head_sha', 'unknown')}\n"
+                f"- Branch: {snap_summary.get('branch', 'unknown')}\n"
+                f"- Is clean: {snap_summary.get('is_clean', True)}\n"
+                f"- Tracked files: {snap_summary.get('tracked_file_count', 0)}\n"
+                f"- Untracked files: {snap_summary.get('untracked_file_count', 0)}\n"
+                f"- Python requires: {snap_summary.get('requires_python')}\n"
+                f"- Runtime deps: {snap_summary.get('runtime_deps', [])}\n"
+                f"- Dev deps: {snap_summary.get('dev_deps', [])}\n"
+                f"- Pytest testpaths: {snap_summary.get('pytest_testpaths', [])}\n"
+                f"- CI config present: {snap_summary.get('ci_config_exists', False)}\n"
+                f"- CI config sha256: {snap_summary.get('ci_config_sha256')}\n"
+                f"- Blind spots: {snap_summary.get('blind_spots', [])}\n\n"
+                "Return ONLY the JSON object, no other text."
+            )
+
             instruction_profile_ref = _instruction_profile_ref_hash(ctx.instruction_profile)
             mimo_request = BackendInvocationRequest(
                 run_binding_id=rb_id,
                 invocation_id=f"mimo-{tr_id}",
                 backend_session_ref=f"{rb_id}:mimo:{tr_id}",
-                backend_profile_ref=bp.meta.integrity_ref,
+                backend_profile_ref=active_bp_ref,
                 context_ref=ctx.meta.integrity_ref,
                 context_digest=ctx_digest,
-                instruction_text="Generate a repository baseline report as JSON.",
+                instruction_text=instruction_text,
                 instruction_profile_ref=instruction_profile_ref,
                 config_ref="e4:mimo-cli:v1",
                 sandbox_policy_ref="trusted-runtime-only:v1",
                 request_digest="",  # placeholder
                 model_ref=None,
                 timeout_seconds=300,
-                max_stdout_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
+                max_stdout_bytes=active_bp_limits.get("max_candidate_bytes", 10_000_000),
                 max_stderr_bytes=1_000_000,
                 fresh_session=True,
                 sandbox_path_ref=request_sandbox_ref,
             )
             mimo_request = replace(
                 mimo_request,
-                request_digest=compute_backend_request_digest(mimo_request),
+                request_digest=_compute_req_digest(mimo_request),
             )
 
             plan = adapter.prepare(mimo_request)
