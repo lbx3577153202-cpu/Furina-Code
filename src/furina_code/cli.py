@@ -20,6 +20,7 @@ from .contracts.objects import (
 from .ledger.sqlite import Ledger
 from .world.snapshot import create_project_snapshot
 from .readonly.context import create_context_envelope, write_context_packet
+from .readonly.file_backend_bridge import prepare_e4_file_transport
 from .backend.candidate import (
     validate_candidate_file,
     validate_candidate_content,
@@ -204,6 +205,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     try:
         _validate_workspace_path(workspace)
         _validate_runtime_not_in_workspace(workspace, str(runtime_dir))
+        from .world.git import resolve_repository_root
+        repository_root = Path(resolve_repository_root(workspace)).resolve()
     except FurinaContractError as exc:
         print(json.dumps({"error": exc.code, "message": exc.message}), file=sys.stderr)
         return 1
@@ -333,6 +336,27 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ctx_path = str(runtime_dir / "context_packet.json")
         ctx_digest = write_context_packet(ctx, ctx_path)
 
+        # Wire to FileBackend — probe, prepare, invoke
+        request_sandbox_ref = f"backend/{rb_id}/{tr_id}"
+        try:
+            transport, candidate_drop_path = prepare_e4_file_transport(
+                runtime_dir=runtime_dir,
+                repository_root=repository_root,
+                run_binding_id=rb_id,
+                task_run_id=tr_id,
+                backend_profile_ref=bp.meta.integrity_ref,
+                context_ref=ctx.meta.integrity_ref,
+                context_digest=ctx_digest,
+                instruction_profile=ctx.instruction_profile,
+                max_candidate_bytes=bp.limits.get("max_candidate_bytes", 10_000_000),
+            )
+        except ContractInvalid as fb_exc:
+            print(json.dumps({
+                "error": fb_exc.code,
+                "message": fb_exc.message,
+            }), file=sys.stderr)
+            return 1
+
         output = {
             "run_binding_id": rb_id,
             "task_id": task_id,
@@ -343,6 +367,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "context_packet_path": ctx_path,
             "context_digest": ctx_digest,
             "status": "AWAITING_EXTERNAL_CANDIDATE",
+            "backend_transport_status": transport.transport_status,
+            "backend_sandbox_ref": request_sandbox_ref,
+            "candidate_drop_path": candidate_drop_path,
         }
         print(canonical_json_dumps(output))
         return 0
