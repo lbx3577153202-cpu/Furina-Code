@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from ..contracts.meta import canonical_json_dumps, compute_integrity_ref
+from ..contracts.errors import ContractInvalid
+from ..contracts.meta import canonical_json_dumps
 
 
 # --- Transport Status (14 values, no more) ---
@@ -115,7 +117,6 @@ class BackendTransportResult:
 
 # --- Request Digest ---
 
-# Fields included in the request digest (no credentials, no env values, no absolute paths)
 _DIGEST_FIELDS = (
     "backend_profile_ref",
     "context_ref",
@@ -132,24 +133,31 @@ _DIGEST_FIELDS = (
 
 
 def compute_backend_request_digest(request: BackendInvocationRequest) -> str:
-    """Compute SHA-256 digest of request fields. No credential or env values included."""
+    """Compute SHA-256 digest of request fields including instruction text hash."""
     digest_payload = {}
     for field in _DIGEST_FIELDS:
         digest_payload[field] = getattr(request, field)
+    digest_payload["instruction_text_sha256"] = hashlib.sha256(
+        request.instruction_text.encode("utf-8")
+    ).hexdigest()
     raw = canonical_json_dumps(digest_payload).encode("utf-8")
-    import hashlib
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 def verify_backend_request_digest(request: BackendInvocationRequest) -> None:
     """Verify that request.request_digest matches recomputed digest. Fail-closed."""
-    from ..contracts.errors import ContractInvalid
     expected = compute_backend_request_digest(request)
     if request.request_digest != expected:
         raise ContractInvalid(
             "Request digest mismatch",
             {"expected": expected, "got": request.request_digest},
         )
+
+
+def compute_empty_args_digest() -> str:
+    """Compute canonical SHA-256 for empty argument array."""
+    raw = canonical_json_dumps([]).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
 # --- BackendPort Protocol ---

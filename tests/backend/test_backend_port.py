@@ -10,6 +10,7 @@ from furina_code.backend.port import (
     TransportStatus,
     compute_backend_request_digest,
     verify_backend_request_digest,
+    compute_empty_args_digest,
 )
 from furina_code.contracts.errors import ContractInvalid
 from furina_code.contracts.objects import OWNER_MAP
@@ -20,15 +21,18 @@ def _make_request(**overrides):
         run_binding_id="rb-1", invocation_id="inv-1",
         backend_session_ref="rb-1:inv-1", backend_profile_ref="sha256:bp",
         context_ref="sha256:ctx", context_digest="sha256:cd",
-        instruction_text="test", instruction_profile_ref="profile:1",
+        instruction_text="test instruction", instruction_profile_ref="profile:1",
         config_ref="config:1", sandbox_policy_ref="sandbox:1",
         request_digest="sha256:" + "0" * 64,
         model_ref=None, timeout_seconds=60,
         max_stdout_bytes=10_000_000, max_stderr_bytes=1_000_000,
-        fresh_session=True, sandbox_path_ref="sandbox/inv-1",
+        fresh_session=True, sandbox_path_ref="sandbox",
     )
     defaults.update(overrides)
-    return BackendInvocationRequest(**defaults)
+    req = BackendInvocationRequest(**defaults)
+    # Fix digest to match
+    digest = compute_backend_request_digest(req)
+    return BackendInvocationRequest(**{**defaults, "request_digest": digest})
 
 
 class TestDTOsFrozen:
@@ -121,23 +125,43 @@ class TestRequestDigest:
         r2 = _make_request(timeout_seconds=120)
         assert compute_backend_request_digest(r1) != compute_backend_request_digest(r2)
 
+    def test_instruction_text_bound_to_digest(self):
+        r1 = _make_request(instruction_text="instruction A")
+        r2 = _make_request(instruction_text="instruction B")
+        assert compute_backend_request_digest(r1) != compute_backend_request_digest(r2)
+
     def test_verify_passes(self):
         r = _make_request()
-        digest = compute_backend_request_digest(r)
-        r2 = _make_request(request_digest=digest)
-        verify_backend_request_digest(r2)  # should not raise
+        verify_backend_request_digest(r)  # should not raise
 
     def test_verify_fails_on_mismatch(self):
-        r = _make_request(request_digest="sha256:" + "f" * 64)
+        # Create request with intentionally wrong digest
+        r = BackendInvocationRequest(
+            run_binding_id="rb-1", invocation_id="inv-1",
+            backend_session_ref="rb-1:inv-1", backend_profile_ref="sha256:bp",
+            context_ref="sha256:ctx", context_digest="sha256:cd",
+            instruction_text="test", instruction_profile_ref="profile:1",
+            config_ref="config:1", sandbox_policy_ref="sandbox:1",
+            request_digest="sha256:" + "f" * 64,
+            model_ref=None, timeout_seconds=60,
+            max_stdout_bytes=10_000_000, max_stderr_bytes=1_000_000,
+            fresh_session=True, sandbox_path_ref="sandbox",
+        )
         with pytest.raises(ContractInvalid, match="digest mismatch"):
             verify_backend_request_digest(r)
 
-    def test_no_credential_fields_in_digest(self):
-        """Digest must not include any credential-like fields."""
-        r = _make_request()
+    def test_digest_includes_instruction_hash(self):
+        """Digest payload must include instruction_text_sha256."""
+        r = _make_request(instruction_text="hello")
         d = compute_backend_request_digest(r)
-        # The digest is a hash, so we verify the digest payload structure
-        # by checking that changing credential-like fields doesn't affect it
-        # (they're not in _DIGEST_FIELDS)
-        assert "token" not in d
-        assert "key" not in d
+        # Changing instruction should change digest
+        r2 = _make_request(instruction_text="hello world")
+        d2 = compute_backend_request_digest(r2)
+        assert d != d2
+
+    def test_empty_args_digest(self):
+        d = compute_empty_args_digest()
+        assert d.startswith("sha256:")
+        # Must be deterministic
+        d2 = compute_empty_args_digest()
+        assert d == d2
