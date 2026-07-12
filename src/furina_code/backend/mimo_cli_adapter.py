@@ -7,9 +7,10 @@ Does NOT import ledger, formal objects factories, or orchestration modules.
 Each invocation:
 - creates a fresh temporary CWD outside the repository
 - never passes --continue
-- captures bounded stdout/stderr
+- captures bounded stdout/stderr via temp files (not in-memory)
 - validates structured output, not just exit code
-- cleans up temporary CWD
+- writes candidate to persistent runtime sandbox
+- cleans up temporary CWD and output files
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ from .port import (
     verify_backend_request_digest,
 )
 
-# Stable error messages (no paths, no credential values)
 _ERROR_MESSAGES: dict[str, str] = {
     "executable_not_found": "MiMo executable not found on PATH.",
     "launch_failed": "Failed to launch MiMo process.",
@@ -60,33 +60,41 @@ def _sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _canonical_json_dumps(obj: object) -> str:
+    """Canonical JSON for digests."""
+    return _json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
 class MiMoCodeCLIAdapter:
     """BackendPort implementation using the MiMo CLI.
 
-    Runtime parameters are injected via constructor (non-serialized).
-    Each invoke creates a fresh temp CWD and never reuses sessions.
+    Constructor takes:
+    - runtime_root: trusted directory for candidate persistence
+    - mimo_executable: path/name of mimo binary
+    - forbidden_roots: directories that must not overlap with runtime_root
     """
 
     def __init__(
         self,
         *,
+        runtime_root: Path,
         mimo_executable: str = "mimo",
         default_model: str | None = None,
         forbidden_roots: tuple[Path, ...] = (),
     ) -> None:
+        self._runtime_root = Path(runtime_root)
         self._mimo_executable = mimo_executable
         self._default_model = default_model
         self._forbidden_roots = tuple(Path(r) for r in forbidden_roots)
 
     def probe(self, request: BackendProbeRequest) -> BackendProbeResult:
-        """Check if MiMo executable is available."""
         errors: list[str] = []
 
-        # Check executable exists
+        # Check runtime root
+        if not self._runtime_root.exists() or not self._runtime_root.is_dir():
+            errors.append("sandbox_violation")
+
+        # Check executable
         try:
             result = subprocess.run(
                 [self._mimo_executable, "--version"],
@@ -96,13 +104,7 @@ class MiMoCodeCLIAdapter:
             version = result.stdout.strip() if result.returncode == 0 else None
             if result.returncode != 0:
                 errors.append("executable_not_found")
-        except FileNotFoundError:
-            errors.append("executable_not_found")
-            version = None
-        except subprocess.TimeoutExpired:
-            errors.append("executable_not_found")
-            version = None
-        except OSError:
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             errors.append("executable_not_found")
             version = None
 
@@ -116,7 +118,6 @@ class MiMoCodeCLIAdapter:
         )
 
     def prepare(self, request: BackendInvocationRequest) -> BackendInvocationPlan:
-        """Verify request digest and generate invocation plan."""
         verify_backend_request_digest(request)
 
         args: list[str] = [
@@ -139,18 +140,18 @@ class MiMoCodeCLIAdapter:
         )
 
     def invoke(self, plan: BackendInvocationPlan) -> BackendTransportResult:
-        """Execute MiMo CLI in a fresh temp CWD and capture output."""
         request = plan.request
 
-        # Create fresh temp CWD outside repository
+        # Create fresh temp CWD
         temp_cwd = Path(tempfile.mkdtemp(prefix="furina_mimo_"))
+        # Temp output files (cleaned up with temp_cwd)
+        stdout_file = temp_cwd / "stdout.bin"
+        stderr_file = temp_cwd / "stderr.bin"
 
-        # Ensure temp CWD is not inside any forbidden root
         temp_cwd_resolved = temp_cwd.resolve()
         for forbidden in self._forbidden_roots:
             try:
                 temp_cwd_resolved.relative_to(forbidden.resolve())
-                # Inside forbidden — clean up and fail
                 shutil.rmtree(temp_cwd, ignore_errors=True)
                 return self._error_result(
                     request, TransportStatus.SANDBOX_VIOLATION,
@@ -160,102 +161,106 @@ class MiMoCodeCLIAdapter:
                 pass
 
         started_at = _now_iso()
+        timeout = max(request.timeout_seconds, 1) if request.timeout_seconds > 0 else 300
         max_stdout = request.max_stdout_bytes
         max_stderr = request.max_stderr_bytes
 
+        # Compute command_args_digest from actual args
+        args_digest = _sha256_bytes(
+            _canonical_json_dumps(list(plan.executable_args)).encode("utf-8")
+        )
+
         try:
             return self._run_process(
-                plan, temp_cwd, started_at, max_stdout, max_stderr,
+                plan, temp_cwd, stdout_file, stderr_file,
+                started_at, max_stdout, max_stderr, timeout, args_digest,
             )
         finally:
-            # Always clean up temp CWD
             shutil.rmtree(temp_cwd, ignore_errors=True)
 
     def _run_process(
         self,
         plan: BackendInvocationPlan,
         temp_cwd: Path,
+        stdout_file: Path,
+        stderr_file: Path,
         started_at: str,
         max_stdout: int,
         max_stderr: int,
+        timeout: int,
+        args_digest: str,
     ) -> BackendTransportResult:
-        """Run the MiMo process and handle all error paths."""
         request = plan.request
         args = list(plan.executable_args)
 
-        timeout = max(request.timeout_seconds, 1) if request.timeout_seconds > 0 else 300
+        # Launch with file-based capture
+        with open(stdout_file, "wb") as fout, open(stderr_file, "wb") as ferr:
+            try:
+                popen_kwargs: dict = dict(
+                    stdout=fout,
+                    stderr=ferr,
+                    cwd=str(temp_cwd),
+                    shell=False,
+                )
+                if sys.platform == "win32":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_kwargs["start_new_session"] = True
 
-        try:
-            proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(temp_cwd),
-                shell=False,
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                    if sys.platform == "win32" else 0
-                ),
-            )
-        except FileNotFoundError:
-            return self._error_result(
-                request, TransportStatus.LAUNCH_FAILED,
-                "executable_not_found",
-            )
-        except OSError as exc:
-            return self._error_result(
-                request, TransportStatus.LAUNCH_FAILED,
-                "launch_failed",
-            )
+                proc = subprocess.Popen(args, **popen_kwargs)
+            except FileNotFoundError:
+                return self._error_result(
+                    request, TransportStatus.LAUNCH_FAILED,
+                    "executable_not_found",
+                )
+            except OSError:
+                return self._error_result(
+                    request, TransportStatus.LAUNCH_FAILED,
+                    "launch_failed",
+                )
 
-        try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill process tree
-            self._kill_process_tree(proc)
-            stdout_bytes = proc.stdout.read() if proc.stdout else b""
-            stderr_bytes = proc.stderr.read() if proc.stderr else b""
-            proc.wait()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._kill_process_tree(proc)
+                proc.wait()
+                finished_at = _now_iso()
+                stdout_bytes, stderr_bytes = self._read_captured_files(
+                    stdout_file, stderr_file, max_stdout + 1, max_stderr + 1,
+                )
+                return self._build_timeout_result(
+                    request, started_at, finished_at,
+                    stdout_bytes, stderr_bytes, max_stdout, max_stderr,
+                    args_digest,
+                )
+
             finished_at = _now_iso()
+            exit_code = proc.returncode
 
-            stdout_truncated, stdout_digest, stdout_ref = self._capture_stream(
-                stdout_bytes, max_stdout,
-            )
-            stderr_truncated, stderr_digest, stderr_ref = self._capture_stream(
-                stderr_bytes, max_stderr,
-            )
-
-            return self._make_result(
-                request,
-                transport_status=TransportStatus.TIMEOUT.value,
-                error_code="timeout_expired",
-                error_detail=_ERROR_MESSAGES["timeout_expired"],
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
-            )
-
-        finished_at = _now_iso()
-        exit_code = proc.returncode
-
-        # Capture streams with limits
-        stdout_truncated, stdout_digest, stdout_ref = self._capture_stream(
-            stdout_bytes, max_stdout,
-        )
-        stderr_truncated, stderr_digest, stderr_ref = self._capture_stream(
-            stderr_bytes, max_stderr,
+        # Read captured files
+        stdout_bytes, stderr_bytes = self._read_captured_files(
+            stdout_file, stderr_file, max_stdout + 1, max_stderr + 1,
         )
 
-        # Check exit code
+        stdout_exceeded = len(stdout_bytes) > max_stdout
+        stderr_exceeded = len(stderr_bytes) > max_stderr
+
+        # Fail-closed on overflow
+        if stdout_exceeded:
+            return self._overflow_result(
+                request, started_at, finished_at,
+                stdout_bytes, stderr_bytes, max_stdout, max_stderr,
+                "stdout", args_digest,
+            )
+        if stderr_exceeded:
+            return self._overflow_result(
+                request, started_at, finished_at,
+                stdout_bytes, stderr_bytes, max_stdout, max_stderr,
+                "stderr", args_digest,
+            )
+
+        # Non-zero exit
         if exit_code != 0:
-            # Even with non-zero exit, check stderr for model errors
             stderr_text = self._safe_decode(stderr_bytes)
             error_code, error_detail = self._classify_stderr(stderr_text)
             return self._make_result(
@@ -265,17 +270,12 @@ class MiMoCodeCLIAdapter:
                 error_detail=error_detail,
                 started_at=started_at,
                 finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
-        # Exit code 0 — parse stdout JSON
+        # Exit 0 — parse JSON
         stdout_text = self._safe_decode(stdout_bytes)
         if stdout_text is None:
             return self._make_result(
@@ -283,19 +283,12 @@ class MiMoCodeCLIAdapter:
                 transport_status=TransportStatus.INVALID_UTF8.value,
                 error_code="invalid_utf8",
                 error_detail=_ERROR_MESSAGES["invalid_utf8"],
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
-        # Validate JSON
         parsed_lines = self._parse_jsonl(stdout_text)
         if parsed_lines is None:
             return self._make_result(
@@ -303,40 +296,25 @@ class MiMoCodeCLIAdapter:
                 transport_status=TransportStatus.PROTOCOL_ERROR.value,
                 error_code="protocol_error",
                 error_detail=_ERROR_MESSAGES["protocol_error"],
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
-        # Check for provider/model errors even with exit code 0
         stderr_text = self._safe_decode(stderr_bytes) or ""
         if self._has_provider_error(stderr_text, parsed_lines):
             error_code, error_detail = self._classify_stderr(stderr_text)
             return self._make_result(
                 request,
                 transport_status=TransportStatus.PROTOCOL_ERROR.value,
-                error_code=error_code,
-                error_detail=error_detail,
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                error_code=error_code, error_detail=error_detail,
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
-        # Extract text content from JSONL events
         text_content = self._extract_text(parsed_lines)
         if not text_content:
             return self._make_result(
@@ -344,69 +322,50 @@ class MiMoCodeCLIAdapter:
                 transport_status=TransportStatus.PROTOCOL_ERROR.value,
                 error_code="protocol_error",
                 error_detail="MiMo produced no text output.",
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
-        # Extract session ID from events
+        # Extract session ID
         session_id = None
         for line in parsed_lines:
             if isinstance(line, dict) and "sessionID" in line:
                 session_id = line["sessionID"]
                 break
 
-        # Build candidate content
+        # Build and write candidate to persistent sandbox
         candidate = self._build_candidate(request, text_content)
-
-        # Write candidate to sandbox
         candidate_bytes = _json.dumps(candidate, ensure_ascii=False).encode("utf-8")
 
-        # Check size limit
-        effective_limit = min(max_stdout, 10 * 1024 * 1024)
-        if len(candidate_bytes) > effective_limit:
+        candidate_path = self._resolve_candidate_path(request)
+        try:
+            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+            candidate_path.write_bytes(candidate_bytes)
+        except OSError:
             return self._make_result(
                 request,
-                transport_status=TransportStatus.OUTPUT_TOO_LARGE.value,
-                error_code="output_too_large",
-                error_detail=_ERROR_MESSAGES["output_too_large"],
-                started_at=started_at,
-                finished_at=finished_at,
-                stdout_ref=stdout_ref,
-                stdout_digest=stdout_digest,
-                stdout_bytes=len(stdout_bytes),
-                stdout_truncated=stdout_truncated,
-                stderr_ref=stderr_ref,
-                stderr_digest=stderr_digest,
-                stderr_bytes=len(stderr_bytes),
-                stderr_truncated=stderr_truncated,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_write_failed",
+                error_detail=_ERROR_MESSAGES["candidate_write_failed"],
+                started_at=started_at, finished_at=finished_at,
+                stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+                stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+                args_digest=args_digest,
             )
 
         return self._make_result(
             request,
             transport_status=TransportStatus.SUCCEEDED.value,
-            error_code=None,
-            error_detail=None,
-            started_at=started_at,
-            finished_at=finished_at,
-            stdout_ref=stdout_ref,
-            stdout_digest=stdout_digest,
-            stdout_bytes=len(stdout_bytes),
-            stdout_truncated=stdout_truncated,
-            stderr_ref=stderr_ref,
-            stderr_digest=stderr_digest,
-            stderr_bytes=len(stderr_bytes),
-            stderr_truncated=stderr_truncated,
+            error_code=None, error_detail=None,
+            started_at=started_at, finished_at=finished_at,
+            stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+            stderr_bytes=stderr_bytes, max_stderr=max_stderr,
             candidate_ref=f"{request.sandbox_path_ref}/candidate.json",
             candidate_digest=_sha256_bytes(candidate_bytes),
             provider_session_ref=session_id,
+            args_digest=args_digest,
         )
 
     def collect(
@@ -414,7 +373,43 @@ class MiMoCodeCLIAdapter:
         plan: BackendInvocationPlan,
         transport: BackendTransportResult,
     ) -> BackendTransportResult:
-        """Collect is a no-op for CLI adapter — candidate written by invoke."""
+        """Collect re-reads the persisted candidate and binds digest."""
+        if transport.transport_status != TransportStatus.SUCCEEDED.value:
+            return transport
+
+        request = plan.request
+        candidate_path = self._resolve_candidate_path(request)
+
+        if not candidate_path.exists():
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Candidate file not found after invoke.",
+                finished_at=_now_iso(),
+            )
+
+        try:
+            raw = candidate_path.read_bytes()
+        except OSError:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Failed to read candidate file.",
+                finished_at=_now_iso(),
+            )
+
+        actual_digest = _sha256_bytes(raw)
+        if actual_digest != transport.candidate_digest:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Candidate file changed after write.",
+                finished_at=_now_iso(),
+            )
+
         return transport
 
     def strict_validate(
@@ -422,25 +417,15 @@ class MiMoCodeCLIAdapter:
         request: BackendInvocationRequest,
         transport: BackendTransportResult,
     ) -> BackendTransportResult:
-        """Validate transport result bindings."""
         if transport.transport_status != TransportStatus.SUCCEEDED.value:
             return transport
 
-        if not transport.candidate_ref:
+        if not transport.candidate_ref or not transport.candidate_digest:
             return dataclasses.replace(
                 transport,
                 transport_status=TransportStatus.AMBIGUOUS.value,
                 error_code="candidate_evidence_mismatch",
-                error_detail="No candidate reference in transport result.",
-                finished_at=_now_iso(),
-            )
-
-        if not transport.candidate_digest:
-            return dataclasses.replace(
-                transport,
-                transport_status=TransportStatus.AMBIGUOUS.value,
-                error_code="candidate_evidence_mismatch",
-                error_detail="No candidate digest in transport result.",
+                error_detail="Missing candidate ref or digest.",
                 finished_at=_now_iso(),
             )
 
@@ -453,13 +438,48 @@ class MiMoCodeCLIAdapter:
                 finished_at=_now_iso(),
             )
 
+        # Re-read the persisted candidate and verify
+        candidate_path = self._resolve_candidate_path(request)
+        if not candidate_path.exists():
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Candidate file not found during validation.",
+                finished_at=_now_iso(),
+            )
+
+        try:
+            raw = candidate_path.read_bytes()
+        except OSError:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Failed to read candidate during validation.",
+                finished_at=_now_iso(),
+            )
+
+        actual_digest = _sha256_bytes(raw)
+        if actual_digest != transport.candidate_digest:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail="Candidate file digest changed since collection.",
+                finished_at=_now_iso(),
+            )
+
         return transport
 
     # --- Internal helpers ---
 
+    def _resolve_candidate_path(self, request: BackendInvocationRequest) -> Path:
+        sandbox = self._runtime_root / request.sandbox_path_ref
+        return sandbox / "candidate.json"
+
     @staticmethod
     def _kill_process_tree(proc: subprocess.Popen) -> None:
-        """Kill process and all children."""
         try:
             if sys.platform == "win32":
                 subprocess.run(
@@ -477,7 +497,6 @@ class MiMoCodeCLIAdapter:
 
     @staticmethod
     def _safe_decode(data: bytes) -> str | None:
-        """Decode bytes to string, returning None on failure."""
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError:
@@ -485,7 +504,6 @@ class MiMoCodeCLIAdapter:
 
     @staticmethod
     def _parse_jsonl(text: str) -> list[dict] | None:
-        """Parse newline-delimited JSON. Returns None on parse failure."""
         lines = []
         for line in text.splitlines():
             line = line.strip()
@@ -501,7 +519,6 @@ class MiMoCodeCLIAdapter:
 
     @staticmethod
     def _extract_text(events: list[dict]) -> str | None:
-        """Extract text content from JSONL events."""
         for event in events:
             if event.get("type") == "text":
                 part = event.get("part", {})
@@ -512,19 +529,14 @@ class MiMoCodeCLIAdapter:
 
     @staticmethod
     def _has_provider_error(stderr_text: str, events: list[dict]) -> bool:
-        """Check for provider/model errors in stderr or events."""
-        error_indicators = [
-            "Error:", "error:", "ProviderModelNotFoundError",
-            "not found", "failed", "authentication",
-        ]
-        for indicator in error_indicators:
+        for indicator in ("Error:", "error:", "ProviderModelNotFoundError",
+                          "not found", "failed", "authentication"):
             if indicator in stderr_text:
                 return True
         return False
 
     @staticmethod
     def _classify_stderr(stderr_text: str) -> tuple[str, str]:
-        """Classify stderr into stable error code and detail."""
         lower = stderr_text.lower()
         if "model not found" in lower or "providernotfounderror" in lower:
             return "provider_error", "MiMo reported model not found."
@@ -534,18 +546,30 @@ class MiMoCodeCLIAdapter:
             return "timeout_expired", _ERROR_MESSAGES["timeout_expired"]
         return "nonzero_exit", _ERROR_MESSAGES["nonzero_exit"]
 
-    def _capture_stream(
-        self, data: bytes, max_bytes: int,
-    ) -> tuple[bool, str, str | None]:
-        """Capture a stream with limit. Returns (truncated, digest, ref)."""
-        truncated = len(data) > max_bytes
-        digest = _sha256_bytes(data[:max_bytes])
-        return truncated, digest, None  # ref is None — not written to disk
+    @staticmethod
+    def _read_captured_files(
+        stdout_file: Path, stderr_file: Path,
+        max_stdout: int, max_stderr: int,
+    ) -> tuple[bytes, bytes]:
+        """Read captured output files with hard limits (max+1 bytes)."""
+        stdout_bytes = b""
+        stderr_bytes = b""
+        try:
+            with open(stdout_file, "rb") as f:
+                stdout_bytes = f.read(max_stdout)
+        except OSError:
+            pass
+        try:
+            with open(stderr_file, "rb") as f:
+                stderr_bytes = f.read(max_stderr)
+        except OSError:
+            pass
+        return stdout_bytes, stderr_bytes
 
+    @staticmethod
     def _build_candidate(
-        self, request: BackendInvocationRequest, text_content: str,
+        request: BackendInvocationRequest, text_content: str,
     ) -> dict:
-        """Build candidate JSON structure."""
         return {
             "schema_version": "1.0",
             "candidate_type": "mimo_cli_response",
@@ -565,26 +589,15 @@ class MiMoCodeCLIAdapter:
         }
 
     def _make_result(
-        self,
-        request: BackendInvocationRequest,
-        *,
-        transport_status: str,
-        error_code: str | None,
-        error_detail: str | None,
-        started_at: str,
-        finished_at: str,
-        stdout_ref: str | None = None,
-        stdout_digest: str | None = None,
-        stdout_bytes: int = 0,
-        stdout_truncated: bool = False,
-        stderr_ref: str | None = None,
-        stderr_digest: str | None = None,
-        stderr_bytes: int = 0,
-        stderr_truncated: bool = False,
-        candidate_ref: str | None = None,
-        candidate_digest: str | None = None,
-        provider_session_ref: str | None = None,
+        self, request, *, transport_status, error_code, error_detail,
+        started_at, finished_at,
+        stdout_bytes=b"", max_stdout=10_000_000,
+        stderr_bytes=b"", max_stderr=1_000_000,
+        candidate_ref=None, candidate_digest=None,
+        provider_session_ref=None, args_digest=None,
     ) -> BackendTransportResult:
+        stdout_truncated = len(stdout_bytes) > max_stdout
+        stderr_truncated = len(stderr_bytes) > max_stderr
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
@@ -592,43 +605,29 @@ class MiMoCodeCLIAdapter:
             provider_session_ref=provider_session_ref,
             provider_ref="mimo-cli",
             executable_version="mimo-cli-1.0",
-            started_at=started_at,
-            finished_at=finished_at,
-            command_args_digest=compute_empty_args_digest(),
-            stdout_ref=stdout_ref,
-            stdout_digest=stdout_digest,
-            stdout_bytes=stdout_bytes,
-            stdout_truncated=stdout_truncated,
-            stderr_ref=stderr_ref,
-            stderr_digest=stderr_digest,
-            stderr_bytes=stderr_bytes,
-            stderr_truncated=stderr_truncated,
-            candidate_ref=candidate_ref,
-            candidate_digest=candidate_digest,
-            manifest_before_ref=None,
-            manifest_before_digest=None,
-            manifest_after_ref=None,
-            manifest_after_digest=None,
+            started_at=started_at, finished_at=finished_at,
+            command_args_digest=args_digest or compute_empty_args_digest(),
+            stdout_ref=None,
+            stdout_digest=_sha256_bytes(stdout_bytes[:max_stdout]) if stdout_bytes else None,
+            stdout_bytes=len(stdout_bytes), stdout_truncated=stdout_truncated,
+            stderr_ref=None,
+            stderr_digest=_sha256_bytes(stderr_bytes[:max_stderr]) if stderr_bytes else None,
+            stderr_bytes=len(stderr_bytes), stderr_truncated=stderr_truncated,
+            candidate_ref=candidate_ref, candidate_digest=candidate_digest,
+            manifest_before_ref=None, manifest_before_digest=None,
+            manifest_after_ref=None, manifest_after_digest=None,
             transport_status=transport_status,
-            error_code=error_code,
-            error_detail=error_detail,
+            error_code=error_code, error_detail=error_detail,
         )
 
-    def _error_result(
-        self,
-        request: BackendInvocationRequest,
-        status: TransportStatus,
-        error_code: str,
-    ) -> BackendTransportResult:
+    def _error_result(self, request, status, error_code):
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
             backend_session_ref=request.backend_session_ref,
             provider_session_ref=None,
-            provider_ref="mimo-cli",
-            executable_version="mimo-cli-1.0",
-            started_at=_now_iso(),
-            finished_at=_now_iso(),
+            provider_ref="mimo-cli", executable_version="mimo-cli-1.0",
+            started_at=_now_iso(), finished_at=_now_iso(),
             command_args_digest=compute_empty_args_digest(),
             stdout_ref=None, stdout_digest=None, stdout_bytes=0, stdout_truncated=False,
             stderr_ref=None, stderr_digest=None, stderr_bytes=0, stderr_truncated=False,
@@ -638,4 +637,35 @@ class MiMoCodeCLIAdapter:
             transport_status=status.value,
             error_code=error_code,
             error_detail=_ERROR_MESSAGES.get(error_code, "Unknown error."),
+        )
+
+    def _build_timeout_result(
+        self, request, started_at, finished_at,
+        stdout_bytes, stderr_bytes, max_stdout, max_stderr, args_digest,
+    ):
+        return self._make_result(
+            request,
+            transport_status=TransportStatus.TIMEOUT.value,
+            error_code="timeout_expired",
+            error_detail=_ERROR_MESSAGES["timeout_expired"],
+            started_at=started_at, finished_at=finished_at,
+            stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+            stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+            args_digest=args_digest,
+        )
+
+    def _overflow_result(
+        self, request, started_at, finished_at,
+        stdout_bytes, stderr_bytes, max_stdout, max_stderr,
+        which, args_digest,
+    ):
+        return self._make_result(
+            request,
+            transport_status=TransportStatus.OUTPUT_TOO_LARGE.value,
+            error_code="output_too_large",
+            error_detail=_ERROR_MESSAGES["output_too_large"],
+            started_at=started_at, finished_at=finished_at,
+            stdout_bytes=stdout_bytes, max_stdout=max_stdout,
+            stderr_bytes=stderr_bytes, max_stderr=max_stderr,
+            args_digest=args_digest,
         )

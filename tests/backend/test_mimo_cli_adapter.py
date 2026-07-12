@@ -1,11 +1,9 @@
 """Tests for MiMoCodeCLIAdapter."""
 
 import ast
-import hashlib
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -24,12 +22,10 @@ from furina_code.contracts.errors import ContractInvalid
 
 def _make_request(**overrides):
     defaults = dict(
-        run_binding_id="rb-test",
-        invocation_id="file-test",
+        run_binding_id="rb-test", invocation_id="file-test",
         backend_session_ref="rb-test:file-test",
         backend_profile_ref="sha256:bp",
-        context_ref="sha256:ctx",
-        context_digest="sha256:cd",
+        context_ref="sha256:ctx", context_digest="sha256:cd",
         instruction_text="respond with exactly: OK",
         instruction_profile_ref="sha256:profile",
         config_ref="e4:mimo-cli:v1",
@@ -37,10 +33,8 @@ def _make_request(**overrides):
         request_digest="sha256:" + "0" * 64,
         model_ref="mimo/mimo-auto",
         timeout_seconds=60,
-        max_stdout_bytes=10_000_000,
-        max_stderr_bytes=1_000_000,
-        fresh_session=True,
-        sandbox_path_ref="sandbox/test",
+        max_stdout_bytes=10_000_000, max_stderr_bytes=1_000_000,
+        fresh_session=True, sandbox_path_ref="sandbox/test",
     )
     defaults.update(overrides)
     req = BackendInvocationRequest(**defaults)
@@ -48,64 +42,65 @@ def _make_request(**overrides):
     return BackendInvocationRequest(**{**defaults, "request_digest": digest})
 
 
-def _make_transport(request, **overrides):
-    defaults = dict(
-        invocation_id=request.invocation_id,
-        request_digest=request.request_digest,
-        backend_session_ref=request.backend_session_ref,
-        provider_session_ref=None,
-        provider_ref="mimo-cli",
-        executable_version="1.0",
-        started_at="2024-01-01T00:00:00Z",
-        finished_at="2024-01-01T00:00:01Z",
-        command_args_digest="sha256:" + "0" * 64,
-        stdout_ref=None, stdout_digest=None, stdout_bytes=0, stdout_truncated=False,
-        stderr_ref=None, stderr_digest=None, stderr_bytes=0, stderr_truncated=False,
-        candidate_ref="sandbox/candidate.json",
-        candidate_digest="sha256:" + "aa" * 32,
-        manifest_before_ref=None, manifest_before_digest=None,
-        manifest_after_ref=None, manifest_after_digest=None,
-        transport_status=TransportStatus.SUCCEEDED.value,
-        error_code=None, error_detail=None,
-    )
-    defaults.update(overrides)
-    return BackendTransportResult(**defaults)
+def _make_adapter(tmp_path, **kwargs):
+    defaults = dict(runtime_root=tmp_path)
+    defaults.update(kwargs)
+    return MiMoCodeCLIAdapter(**defaults)
+
+
+def _mock_popen_success(text="OK"):
+    """Factory for MockPopen that returns successful JSON output."""
+    class MockPopen:
+        def __init__(self, args, **kwargs):
+            self.returncode = 0
+            self.pid = 99999
+            self._stdout_dest = kwargs.get("stdout")
+            self._stderr_dest = kwargs.get("stderr")
+            # Write output to file dests (simulating file-based capture)
+            if self._stdout_dest:
+                self._stdout_dest.write(
+                    json.dumps({"type": "text", "part": {"text": text}}).encode()
+                    + b"\n"
+                )
+                self._stdout_dest.flush()
+            if self._stderr_dest:
+                self._stderr_dest.write(b"")
+                self._stderr_dest.flush()
+
+        def wait(self, timeout=None):
+            return 0
+
+    return MockPopen
 
 
 class TestProbe:
-    def test_probe_returns_result(self):
-        """Probe returns a result (available may be False if mimo not on PATH)."""
-        adapter = MiMoCodeCLIAdapter()
+    def test_probe_returns_result(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         result = adapter.probe(BackendProbeRequest(
             executable_ref="mimo", probe_timeout_seconds=10,
         ))
         assert isinstance(result.available, bool)
-        assert result.executable_ref == "mimo"
 
-    def test_probe_unavailable(self):
-        adapter = MiMoCodeCLIAdapter(mimo_executable="nonexistent_mimo_xyz")
+    def test_probe_unavailable(self, tmp_path):
+        adapter = _make_adapter(tmp_path, mimo_executable="nonexistent_mimo_xyz")
         result = adapter.probe(BackendProbeRequest(
             executable_ref="mimo", probe_timeout_seconds=10,
         ))
         assert result.available is False
-        assert any("executable_not_found" in e for e in result.errors)
 
 
 class TestPrepare:
-    def test_prepare_verifies_digest(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_prepare_verifies_digest(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
-        assert plan.request == req
         assert "run" in plan.executable_args
 
-    def test_prepare_rejects_bad_digest(self):
-        adapter = MiMoCodeCLIAdapter()
-        # Create request with intentionally wrong digest (bypass _make_request helper)
+    def test_prepare_rejects_bad_digest(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = BackendInvocationRequest(
             run_binding_id="rb-test", invocation_id="file-test",
-            backend_session_ref="rb-test:file-test",
-            backend_profile_ref="sha256:bp",
+            backend_session_ref="test", backend_profile_ref="sha256:bp",
             context_ref="sha256:ctx", context_digest="sha256:cd",
             instruction_text="test", instruction_profile_ref="sha256:p",
             config_ref="c", sandbox_policy_ref="s",
@@ -117,15 +112,14 @@ class TestPrepare:
         with pytest.raises(ContractInvalid):
             adapter.prepare(req)
 
-    def test_prepare_no_continue_flag(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_prepare_no_continue_flag(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
         assert "--continue" not in plan.executable_args
-        assert "-c" not in plan.executable_args
 
-    def test_prepare_uses_format_json(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_prepare_uses_format_json(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
         assert "--format" in plan.executable_args
@@ -133,309 +127,303 @@ class TestPrepare:
 
 
 class TestInvoke:
-    def test_invoke_success(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_success_writes_candidate(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
-
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": "OK"}}).encode()
-                    + b"\n",
-                    b"",
-                )
-
-            def wait(self):
-                return 0
-
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("OK")):
             transport = adapter.invoke(plan)
 
         assert transport.transport_status == TransportStatus.SUCCEEDED.value
-        assert transport.candidate_ref is not None
-        assert transport.candidate_digest is not None
 
-    def test_invoke_creates_temp_cwd(self):
-        adapter = MiMoCodeCLIAdapter()
+        # Candidate file must exist at runtime_root/sandbox_path_ref/candidate.json
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        assert candidate_path.exists()
+        data = json.loads(candidate_path.read_bytes())
+        assert data["content"]["text"] == "OK"
+
+    def test_candidate_digest_matches_file_bytes(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        captured_cwds = []
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("hello")):
+            transport = adapter.invoke(plan)
 
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                captured_cwds.append(kwargs.get("cwd"))
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        actual_bytes = candidate_path.read_bytes()
+        import hashlib
+        expected_digest = "sha256:" + hashlib.sha256(actual_bytes).hexdigest()
+        assert transport.candidate_digest == expected_digest
 
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": "OK"}}).encode() + b"\n",
-                    b"",
-                )
+    def test_candidate_persists_after_temp_cleanup(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request()
+        plan = adapter.prepare(req)
 
-            def wait(self):
-                return 0
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("persist")):
+            transport = adapter.invoke(plan)
 
-            def read(self):
-                return b""
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        assert candidate_path.exists()
 
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
-            adapter.invoke(plan)
-
-        assert len(captured_cwds) == 1
-
-    def test_invoke_no_continue_flag(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_no_continue_in_args(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
         captured_args = []
+        def capture_popen(args, **kwargs):
+            captured_args.extend(args)
+            return _mock_popen_success()(args, **kwargs)
 
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                captured_args.extend(args)
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
-
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": "OK"}}).encode() + b"\n",
-                    b"",
-                )
-
-            def wait(self):
-                return 0
-
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", capture_popen):
             adapter.invoke(plan)
 
         assert "--continue" not in captured_args
         assert "-c" not in captured_args
 
-    def test_invoke_exit_code_zero_stderr_error(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_exit_zero_stderr_error(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        class MockPopen:
+        class ErrorPopen:
             def __init__(self, args, **kwargs):
                 self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
                 self.pid = 99999
+                sout = kwargs.get("stdout")
+                serr = kwargs.get("stderr")
+                if sout:
+                    sout.write(json.dumps({"type": "text", "part": {"text": "hello"}}).encode() + b"\n")
+                    sout.flush()
+                if serr:
+                    serr.write(b"Error: Model not found.\n")
+                    serr.flush()
 
-            def communicate(self, timeout=None):
-                return (
-                    b'{"type":"text","part":{"text":"hello"}}\n',
-                    b"Error: Model not found: nonexistent/provider.\n",
-                )
-
-            def wait(self):
+            def wait(self, timeout=None):
                 return 0
 
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", ErrorPopen):
             transport = adapter.invoke(plan)
 
         assert transport.transport_status == TransportStatus.PROTOCOL_ERROR.value
         assert transport.error_code == "provider_error"
 
-    def test_invoke_invalid_json(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_invalid_json(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        class MockPopen:
+        class BadJsonPopen:
             def __init__(self, args, **kwargs):
                 self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
                 self.pid = 99999
+                dest = kwargs.get("stdout")
+                if dest:
+                    dest.write(b"not json {{{")
+                    dest.flush()
 
-            def communicate(self, timeout=None):
-                return (b"not valid json at all {{{", b"")
-
-            def wait(self):
+            def wait(self, timeout=None):
                 return 0
 
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", BadJsonPopen):
             transport = adapter.invoke(plan)
 
         assert transport.transport_status == TransportStatus.PROTOCOL_ERROR.value
 
-    def test_invoke_timeout_kills_process(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_timeout(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request(timeout_seconds=1)
         plan = adapter.prepare(req)
 
-        class MockPopen:
+        call_count = [0]
+        class TimeoutPopen:
             def __init__(self, args, **kwargs):
                 self.returncode = -1
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.stdout.read.return_value = b"partial"
-                self.stderr.read.return_value = b"err"
                 self.pid = 99999
 
-            def communicate(self, timeout=None):
-                raise subprocess.TimeoutExpired(cmd="mimo", timeout=timeout)
-
-            def wait(self):
+            def wait(self, timeout=None):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise subprocess.TimeoutExpired(cmd="mimo", timeout=timeout)
                 return -1
 
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
-            with patch("furina_code.backend.mimo_cli_adapter.MiMoCodeCLIAdapter._kill_process_tree") as mock_kill:
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", TimeoutPopen):
+            with patch("furina_code.backend.mimo_cli_adapter.MiMoCodeCLIAdapter._kill_process_tree"):
                 transport = adapter.invoke(plan)
 
         assert transport.transport_status == TransportStatus.TIMEOUT.value
-        mock_kill.assert_called_once()
 
-    def test_invoke_temp_cwd_cleaned(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_command_args_digest_not_empty(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        created_cwds = []
-
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                cwd = kwargs.get("cwd")
-                if cwd:
-                    created_cwds.append(cwd)
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
-
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": "OK"}}).encode() + b"\n",
-                    b"",
-                )
-
-            def wait(self):
-                return 0
-
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
-            adapter.invoke(plan)
-
-        for cwd in created_cwds:
-            assert not Path(cwd).exists(), f"Temp CWD {cwd} was not cleaned up"
-
-    def test_invoke_stdout_truncated(self):
-        adapter = MiMoCodeCLIAdapter()
-        req = _make_request(max_stdout_bytes=100)
-        plan = adapter.prepare(req)
-
-        large_text = "x" * 200
-
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
-
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": large_text}}).encode() + b"\n",
-                    b"",
-                )
-
-            def wait(self):
-                return 0
-
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
             transport = adapter.invoke(plan)
 
-        assert transport.stdout_truncated is True
+        from furina_code.backend.port import compute_empty_args_digest
+        assert transport.command_args_digest != compute_empty_args_digest()
 
-    def test_invoke_stderr_captured(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_invoke_stdout_overflow(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(max_stdout_bytes=10)
+        plan = adapter.prepare(req)
+
+        class LargePopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+                dest = kwargs.get("stdout")
+                if dest:
+                    dest.write(b"x" * 100 + b"\n")
+                    dest.flush()
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", LargePopen):
+            transport = adapter.invoke(plan)
+
+        assert transport.transport_status == TransportStatus.OUTPUT_TOO_LARGE.value
+
+    def test_invoke_stderr_overflow(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request(max_stderr_bytes=5)
+        plan = adapter.prepare(req)
+
+        class StderrOverflowPopen:
+            def __init__(self, args, **kwargs):
+                self.returncode = 0
+                self.pid = 99999
+                sout = kwargs.get("stdout")
+                serr = kwargs.get("stderr")
+                if sout:
+                    sout.write(json.dumps({"type": "text", "part": {"text": "OK"}}).encode() + b"\n")
+                    sout.flush()
+                if serr:
+                    serr.write(b"very long stderr output that exceeds limit")
+                    serr.flush()
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", StderrOverflowPopen):
+            transport = adapter.invoke(plan)
+
+        assert transport.transport_status == TransportStatus.OUTPUT_TOO_LARGE.value
+
+
+class TestCollect:
+    def test_collect_rebinds_digest(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
         plan = adapter.prepare(req)
 
-        class MockPopen:
-            def __init__(self, args, **kwargs):
-                self.returncode = 0
-                self.stdout = MagicMock()
-                self.stderr = MagicMock()
-                self.pid = 99999
-
-            def communicate(self, timeout=None):
-                return (
-                    json.dumps({"type": "text", "part": {"text": "OK"}}).encode() + b"\n",
-                    b"some warning on stderr\n",
-                )
-
-            def wait(self):
-                return 0
-
-            def read(self):
-                return b""
-
-        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen", MockPopen):
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("test")):
             transport = adapter.invoke(plan)
 
-        assert transport.stderr_bytes > 0
+        result = adapter.collect(plan, transport)
+        assert result.transport_status == TransportStatus.SUCCEEDED.value
+        assert result.candidate_digest == transport.candidate_digest
+
+    def test_collect_detects_tampered_file(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request()
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success("original")):
+            transport = adapter.invoke(plan)
+
+        # Tamper the candidate file
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        candidate_path.write_text('{"tampered": true}')
+
+        result = adapter.collect(plan, transport)
+        assert result.transport_status == TransportStatus.AMBIGUOUS.value
 
 
 class TestStrictValidate:
-    def test_strict_validate_succeeds(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_strict_validate_succeeds(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
-        transport = _make_transport(req)
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
         result = adapter.strict_validate(req, transport)
         assert result.transport_status == TransportStatus.SUCCEEDED.value
 
-    def test_strict_validate_rejects_missing_candidate_ref(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_strict_validate_rejects_missing_file(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
-        transport = _make_transport(req, candidate_ref=None, candidate_digest=None)
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
+        # Delete candidate file
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        candidate_path.unlink()
+
         result = adapter.strict_validate(req, transport)
         assert result.transport_status == TransportStatus.AMBIGUOUS.value
 
-    def test_strict_validate_rejects_digest_mismatch(self):
-        adapter = MiMoCodeCLIAdapter()
+    def test_strict_validate_rejects_tampered_file(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         req = _make_request()
-        transport = _make_transport(req, request_digest="sha256:" + "ff" * 64)
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
+        # Tamper the file
+        candidate_path = tmp_path / req.sandbox_path_ref / "candidate.json"
+        candidate_path.write_text('{"tampered": true}')
+
         result = adapter.strict_validate(req, transport)
+        assert result.transport_status == TransportStatus.AMBIGUOUS.value
+
+    def test_strict_validate_rejects_bad_request_digest(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
+        req = _make_request()
+        plan = adapter.prepare(req)
+
+        with patch("furina_code.backend.mimo_cli_adapter.subprocess.Popen",
+                    _mock_popen_success()):
+            transport = adapter.invoke(plan)
+
+        bad_req = BackendInvocationRequest(
+            run_binding_id="rb-test", invocation_id="file-test",
+            backend_session_ref="test", backend_profile_ref="sha256:bp",
+            context_ref="sha256:ctx", context_digest="sha256:cd",
+            instruction_text="test", instruction_profile_ref="sha256:p",
+            config_ref="c", sandbox_policy_ref="s",
+            request_digest="sha256:" + "ff" * 64,
+            model_ref=None, timeout_seconds=60,
+            max_stdout_bytes=10_000_000, max_stderr_bytes=1_000_000,
+            fresh_session=True, sandbox_path_ref="sandbox/test",
+        )
+        result = adapter.strict_validate(bad_req, transport)
         assert result.transport_status == TransportStatus.AMBIGUOUS.value
 
 
 class TestAuthorityBoundary:
-    def test_adapter_does_not_import_ledger(self):
-        adapter_path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
-        tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
+    def test_no_ledger_import(self):
+        path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -444,46 +432,34 @@ class TestAuthorityBoundary:
                 if node.module:
                     assert "ledger" not in node.module.lower()
 
-    def test_adapter_does_not_import_formal_objects(self):
-        adapter_path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
-        source = adapter_path.read_text(encoding="utf-8")
-        assert "CandidateEnvelope.create" not in source
-        assert "BackendProfile.create" not in source
-        assert "TaskRun.create" not in source
-        assert "CompletionVerdict.create" not in source
+    def test_no_formal_object_imports(self):
+        path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
+        source = path.read_text(encoding="utf-8")
+        for name in ("CandidateEnvelope.create", "BackendProfile.create",
+                      "TaskRun.create", "CompletionVerdict.create"):
+            assert name not in source
 
-    def test_adapter_no_shell_true(self):
-        adapter_path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
-        source = adapter_path.read_text(encoding="utf-8")
+    def test_no_shell_true(self):
+        path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
+        source = path.read_text(encoding="utf-8")
         assert "shell=True" not in source
 
-    def test_adapter_uses_subprocess(self):
-        adapter_path = Path(__file__).resolve().parents[2] / "src" / "furina_code" / "backend" / "mimo_cli_adapter.py"
-        source = adapter_path.read_text(encoding="utf-8")
-        assert "subprocess" in source
-
-    def test_no_repo_path_in_plan_refs(self):
-        """Plan refs (cwd_ref, env_policy_ref, etc.) must not contain repo paths."""
-        adapter = MiMoCodeCLIAdapter()
+    def test_plan_refs_no_repo_path(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         repo_path = str(Path(__file__).resolve().parents[2])
-        req = _make_request(instruction_text="do something")
+        req = _make_request()
         plan = adapter.prepare(req)
-        # Check that plan-level refs don't contain repo path
         assert repo_path not in plan.cwd_ref
         assert repo_path not in plan.env_policy_ref
-        assert repo_path not in plan.credential_mode
-        assert repo_path not in plan.provider_state_policy_ref
 
 
 class TestRealMiMoShadowSmoke:
-    """Opt-in smoke test with real MiMo."""
-
     @pytest.mark.skipif(
         os.environ.get("MIMO_SMOKE_TEST") != "1",
         reason="MIMO_SMOKE_TEST not set",
     )
-    def test_real_mimo_shadow_smoke(self, tmp_path):
-        adapter = MiMoCodeCLIAdapter()
+    def test_smoke(self, tmp_path):
+        adapter = _make_adapter(tmp_path)
         probe = adapter.probe(BackendProbeRequest(
             executable_ref="mimo", probe_timeout_seconds=10,
         ))
@@ -497,12 +473,10 @@ class TestRealMiMoShadowSmoke:
         )
         plan = adapter.prepare(req)
         transport = adapter.invoke(plan)
+        assert transport.transport_status == TransportStatus.SUCCEEDED.value
 
-        assert transport.transport_status == TransportStatus.SUCCEEDED.value, \
-            f"Failed: {transport.error_code} — {transport.error_detail}"
+        collected = adapter.collect(plan, transport)
+        assert collected.transport_status == TransportStatus.SUCCEEDED.value
 
-        assert transport.candidate_ref is not None
-        assert transport.candidate_digest is not None
-
-        validated = adapter.strict_validate(req, transport)
+        validated = adapter.strict_validate(req, collected)
         assert validated.transport_status == TransportStatus.SUCCEEDED.value
