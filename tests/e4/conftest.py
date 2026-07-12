@@ -43,8 +43,42 @@ def get_context_digest(runtime: Path) -> str:
     ).hexdigest()
 
 
+def get_run_binding_id(runtime: Path) -> str:
+    """Get the run_binding_id from the ledger."""
+    ledger = Ledger(str(runtime / "inspect.sqlite3"))
+    ledger.open()
+    conn = ledger.conn
+    cur = conn.execute("SELECT DISTINCT run_binding_id FROM event_envelopes LIMIT 1")
+    row = cur.fetchone()
+    ledger.close()
+    return row[0] if row else ""
+
+
+def get_task_run_id(runtime: Path) -> str:
+    """Get the task_run_id from the ledger."""
+    ledger = Ledger(str(runtime / "inspect.sqlite3"))
+    ledger.open()
+    conn = ledger.conn
+    cur = conn.execute(
+        "SELECT DISTINCT task_run_id FROM event_envelopes LIMIT 1"
+    )
+    row = cur.fetchone()
+    ledger.close()
+    return row[0] if row else ""
+
+
+def get_candidate_drop_path(runtime: Path) -> str:
+    """Compute the deterministic candidate drop path for a run."""
+    rb_id = get_run_binding_id(runtime)
+    tr_id = get_task_run_id(runtime)
+    return str(runtime / "backend" / rb_id / tr_id / "candidate.json")
+
+
 def write_candidate_file(runtime: Path, **content_overrides) -> str:
-    """Write a valid candidate JSON file using prepare output data."""
+    """Write a valid candidate JSON file using prepare output data.
+
+    Writes to the deterministic sandbox candidate path.
+    """
     ctx_path = runtime / "context_packet.json"
     ctx_data = json.loads(ctx_path.read_text(encoding="utf-8"))
     snap = ctx_data.get("context_payload", {}).get("snapshot_summary", {})
@@ -80,17 +114,7 @@ def write_candidate_file(runtime: Path, **content_overrides) -> str:
         "claimed_assumptions": [],
         "requested_actions": [],
     }
-    cand_path = runtime / "candidate.json"
-    cand_path.write_text(json.dumps(candidate), encoding="utf-8")
-    return str(cand_path)
-
-
-def get_run_binding_id(runtime: Path) -> str:
-    """Get the run_binding_id from the ledger."""
-    ledger = Ledger(str(runtime / "inspect.sqlite3"))
-    ledger.open()
-    conn = ledger.conn
-    cur = conn.execute("SELECT DISTINCT run_binding_id FROM event_envelopes LIMIT 1")
-    row = cur.fetchone()
-    ledger.close()
-    return row[0] if row else ""
+    cand_path = get_candidate_drop_path(runtime)
+    Path(cand_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(cand_path).write_text(json.dumps(candidate), encoding="utf-8")
+    return cand_path

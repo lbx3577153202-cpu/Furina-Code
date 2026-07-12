@@ -20,7 +20,7 @@ from .contracts.objects import (
 from .ledger.sqlite import Ledger
 from .world.snapshot import create_project_snapshot
 from .readonly.context import create_context_envelope, write_context_packet
-from .readonly.file_backend_bridge import prepare_e4_file_transport
+from .readonly.file_backend_bridge import prepare_e4_file_transport, finalize_e4_file_transport
 from .backend.candidate import (
     validate_candidate_file,
     validate_candidate_content,
@@ -427,46 +427,17 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             print(json.dumps({"error": "NO_TASK_RUN", "message": "No TaskRun found"}), file=sys.stderr)
             return 1
 
-        # Idempotency check: if already terminal
-        if tr_payload["phase"] == "terminal" and tr_payload["disposition"] == "terminal":
-            # Load existing CompletionVerdict
-            cv_meta, cv_payload, _ = _load_latest_object(ledger, rb_id, "CompletionVerdict")
-            if cv_meta is not None:
-                # Check candidate digest
-                _, _, cand_digest = read_candidate_once(candidate_path)
-                ce_meta, ce_payload, _ = _load_latest_object(ledger, rb_id, "CandidateEnvelope")
-                if ce_meta is not None and ce_payload.get("candidate_digest") == cand_digest:
-                    # Same candidate replay — return complete core result from Ledger
-                    vp_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationPlan")
-                    vv_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationVerdict")
-                    tr_head_meta, _, _ = _load_latest_object(ledger, rb_id, "TaskRun")
-                    print(canonical_json_dumps({
-                        "candidate_ref": ce_meta.integrity_ref,
-                        "verification_plan_ref": vp_meta.integrity_ref if vp_meta else None,
-                        "verification_verdict_ref": vv_meta.integrity_ref if vv_meta else None,
-                        "completion_verdict_ref": cv_meta.integrity_ref,
-                        "task_run_ref": tr_head_meta.integrity_ref if tr_head_meta else None,
-                        "outcome": cv_payload["outcome"],
-                        "completed_items": cv_payload.get("completed_items", []),
-                        "incomplete_items": cv_payload.get("incomplete_items", []),
-                        "unverified_items": cv_payload.get("unverified_items", []),
-                        "residual_risks": cv_payload.get("residual_risks", []),
-                        "user_effect": cv_payload.get("user_effect", ""),
-                    }))
-                    ledger.close()
-                    return 0
-                else:
-                    # Different candidate
-                    print(json.dumps({"error": "IDEMPOTENCY_CONFLICT",
-                                      "message": "Different candidate submitted for completed run"}), file=sys.stderr)
-                    ledger.close()
-                    return 1
+        # Idempotency check deferred — requires FileBackend canonical digest
 
-        # Must be in deliberate/external_blocked
-        if tr_payload["phase"] != "deliberate" or tr_payload["disposition"] != "external_blocked":
+        # Must be in deliberate/external_blocked (or terminal for idempotency)
+        is_terminal = (tr_payload["phase"] == "terminal"
+                       and tr_payload["disposition"] == "terminal")
+        if not is_terminal and (tr_payload["phase"] != "deliberate"
+                                or tr_payload["disposition"] != "external_blocked"):
             print(json.dumps({
                 "error": "WRONG_PHASE",
-                "message": f"TaskRun is {tr_payload['phase']}/{tr_payload['disposition']}, expected deliberate/external_blocked",
+                "message": f"TaskRun is {tr_payload['phase']}/{tr_payload['disposition']}, "
+                           f"expected deliberate/external_blocked or terminal/terminal",
             }), file=sys.stderr)
             return 1
 
@@ -533,18 +504,95 @@ def cmd_finalize(args: argparse.Namespace) -> int:
                               "message": "Context packet digest does not match ContextEnvelope"}), file=sys.stderr)
             return 1
 
-        # Single-read candidate
-        cand_text, cand_parsed, cand_digest = read_candidate_once(candidate_path)
+        # Resolve repository root for FileBackend forbidden_roots
+        # ProjectSnapshot git_ref does not store repository_root.
+        # The runtime_dir was already validated to be outside the repository
+        # during prepare. For finalize, FileBackend only reads within runtime_dir.
+        repository_root = None  # not available from ledger; use empty forbidden_roots
 
-        # Validate candidate content with strict schema and context digest
-        validate_candidate_content(
-            cand_text,
-            expected_context_ref=ctx_meta.integrity_ref,
-            expected_context_digest=ctx_payload.get("context_digest", ""),
-            expected_backend_profile_ref=bp_meta.integrity_ref if bp_meta else "e4-repository-baseline-v1",
+        # FileBackend lifecycle: prepare → invoke → collect → strict_validate
+        instruction_profile = ctx_packet.get("instruction_profile", {"id": "e4-repository-baseline-v1", "version": "1.0"})
+        try:
+            transport = finalize_e4_file_transport(
+                runtime_dir=runtime_dir,
+                repository_root=repository_root,
+                run_binding_id=rb_id,
+                task_run_id=tr_meta.task_run_id,
+                candidate_file=candidate_path,
+                backend_profile_ref=bp_meta.integrity_ref if bp_meta else "e4-repository-baseline-v1",
+                context_ref=ctx_meta.integrity_ref,
+                context_digest=ctx_payload.get("context_digest", ""),
+                instruction_profile=instruction_profile,
+                max_candidate_bytes=bp_payload.get("limits", {}).get("max_candidate_bytes", 10_000_000) if bp_payload else 10_000_000,
+            )
+        except ContractInvalid as fb_exc:
+            # On terminal runs, collect/validation failure with different
+            # candidate maps to IDEMPOTENCY_CONFLICT
+            if is_terminal and fb_exc.message in (
+                "FILE_BACKEND_COLLECT_FAILED",
+                "FILE_BACKEND_VALIDATION_FAILED",
+                "FILE_BACKEND_INVOKE_FAILED",
+                "CANDIDATE_NOT_FOUND",
+            ):
+                print(json.dumps({
+                    "error": "IDEMPOTENCY_CONFLICT",
+                    "message": "Different candidate submitted for completed run",
+                }), file=sys.stderr)
+                ledger.close()
+                return 1
+            print(json.dumps({
+                "error": fb_exc.code,
+                "message": fb_exc.message,
+            }), file=sys.stderr)
+            return 1
+
+        # Read canonical collected candidate artifact (frozen evidence)
+        # The canonical artifact path is deterministic from sandbox_path_ref
+        canonical_artifact_path = runtime_dir / transport.candidate_ref
+        cand_text, cand_parsed, cand_raw_hex = read_candidate_once(
+            str(canonical_artifact_path)
         )
+        cand_digest = f"sha256:{cand_raw_hex}"
 
-        # Create CandidateEnvelope (only after all validation passes)
+        if cand_digest != transport.candidate_digest:
+            print(json.dumps({
+                "error": "CANDIDATE_EVIDENCE_MISMATCH",
+                "message": "Canonical artifact digest does not match transport digest",
+            }), file=sys.stderr)
+            return 1
+
+        # Idempotency check using FileBackend canonical digest
+        if is_terminal:
+            cv_meta, cv_payload, _ = _load_latest_object(ledger, rb_id, "CompletionVerdict")
+            if cv_meta is not None:
+                ce_meta, ce_payload, _ = _load_latest_object(ledger, rb_id, "CandidateEnvelope")
+                if ce_meta is not None and ce_payload.get("candidate_digest") == cand_digest:
+                    # Same candidate replay — return complete core result from Ledger
+                    vp_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationPlan")
+                    vv_meta, _, _ = _load_latest_object(ledger, rb_id, "VerificationVerdict")
+                    tr_head_meta, _, _ = _load_latest_object(ledger, rb_id, "TaskRun")
+                    print(canonical_json_dumps({
+                        "candidate_ref": ce_meta.integrity_ref,
+                        "verification_plan_ref": vp_meta.integrity_ref if vp_meta else None,
+                        "verification_verdict_ref": vv_meta.integrity_ref if vv_meta else None,
+                        "completion_verdict_ref": cv_meta.integrity_ref,
+                        "task_run_ref": tr_head_meta.integrity_ref if tr_head_meta else None,
+                        "outcome": cv_payload["outcome"],
+                        "completed_items": cv_payload.get("completed_items", []),
+                        "incomplete_items": cv_payload.get("incomplete_items", []),
+                        "unverified_items": cv_payload.get("unverified_items", []),
+                        "residual_risks": cv_payload.get("residual_risks", []),
+                        "user_effect": cv_payload.get("user_effect", ""),
+                    }))
+                    ledger.close()
+                    return 0
+                else:
+                    print(json.dumps({"error": "IDEMPOTENCY_CONFLICT",
+                                      "message": "Different candidate submitted for completed run"}), file=sys.stderr)
+                    ledger.close()
+                    return 1
+
+        # Create CandidateEnvelope (only after FileBackend validation passes)
         ce = create_candidate_envelope(
             run_binding_id=rb_id,
             task_id=tr_meta.task_id, task_run_id=tr_meta.task_run_id,
