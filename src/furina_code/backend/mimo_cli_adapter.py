@@ -84,9 +84,40 @@ class MiMoCodeCLIAdapter:
         forbidden_roots: tuple[Path, ...] = (),
     ) -> None:
         self._runtime_root = Path(runtime_root)
-        self._mimo_executable = mimo_executable
+        self._mimo_executable = self._resolve_executable(mimo_executable)
         self._default_model = default_model
         self._forbidden_roots = tuple(Path(r) for r in forbidden_roots)
+
+    @staticmethod
+    def _resolve_executable(name: str) -> str:
+        """Resolve mimo executable name to an absolute path.
+
+        On Windows, npm installs generate mimo.cmd which shutil.which("mimo")
+        may not find. Try the base name first, then append .cmd on Windows.
+        If the input is already an absolute path, verify it exists and return it.
+        """
+        p = Path(name)
+        if p.is_absolute():
+            if not p.exists():
+                raise ContractInvalid(
+                    "MiMo executable not found",
+                    {"executable": name},
+                )
+            return str(p)
+
+        # Try shutil.which with the original name
+        resolved = shutil.which(name)
+        if resolved is not None:
+            return resolved
+
+        # Windows fallback: try name + ".cmd"
+        if sys.platform == "win32":
+            resolved = shutil.which(name + ".cmd")
+            if resolved is not None:
+                return resolved
+
+        # Return original name — probe will report unavailable
+        return name
 
     def probe(self, request: BackendProbeRequest) -> BackendProbeResult:
         errors: list[str] = []

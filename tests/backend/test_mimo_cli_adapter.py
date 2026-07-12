@@ -3,7 +3,9 @@
 import ast
 import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -103,6 +105,66 @@ class TestProbe:
             executable_ref="mimo", probe_timeout_seconds=10,
         ))
         assert result.available is False
+
+
+class TestExecutableResolution:
+    def test_windows_which_mimo_none_cmd_resolves(self, tmp_path):
+        """On Windows, shutil.which('mimo') may return None but .cmd resolves."""
+        from furina_code.backend.mimo_cli_adapter import MiMoCodeCLIAdapter
+        import shutil
+
+        if sys.platform != "win32":
+            pytest.skip("Windows-only test")
+
+        # Check that mimo is not directly found but mimo.cmd is
+        base_which = shutil.which("mimo")
+        cmd_which = shutil.which("mimo.cmd")
+
+        if base_which is None and cmd_which is not None:
+            adapter = MiMoCodeCLIAdapter(runtime_root=tmp_path)
+            # Should resolve to the .cmd path
+            assert adapter._mimo_executable == cmd_which
+
+    def test_resolved_path_used_in_probe(self, tmp_path):
+        """Probe must use the resolved executable path."""
+        adapter = _make_adapter(tmp_path)
+        result = adapter.probe(BackendProbeRequest(
+            executable_ref="mimo", probe_timeout_seconds=10,
+        ))
+        # If mimo is available, probe should succeed
+        # (on Windows with mimo.cmd, it should resolve and succeed)
+        if shutil.which("mimo") or (sys.platform == "win32" and shutil.which("mimo.cmd")):
+            assert result.available is True
+
+    def test_resolved_path_used_in_prepare(self, tmp_path):
+        """Prepare must use the resolved executable path in args."""
+        adapter = _make_adapter(tmp_path)
+        req = _make_request()
+        plan = adapter.prepare(req)
+        executable = plan.executable_args[0]
+        # executable must be the resolved path, not just "mimo"
+        resolved = shutil.which("mimo") or (sys.platform == "win32" and shutil.which("mimo.cmd")) or "mimo"
+        if resolved and resolved != "mimo":
+            assert executable == resolved
+        # shell=False must be preserved (verified by Popen calls in invoke tests)
+
+    def test_absolute_path_verified(self, tmp_path):
+        """Absolute path is verified to exist."""
+        from furina_code.backend.mimo_cli_adapter import MiMoCodeCLIAdapter
+        from furina_code.contracts.errors import ContractInvalid
+
+        nonexistent = tmp_path / "nonexistent" / "mimo.exe"
+        with pytest.raises(ContractInvalid, match="MiMo executable not found"):
+            MiMoCodeCLIAdapter(runtime_root=tmp_path, mimo_executable=str(nonexistent))
+
+    def test_absolute_existing_path_accepted(self, tmp_path):
+        """Absolute path that exists is accepted."""
+        from furina_code.backend.mimo_cli_adapter import MiMoCodeCLIAdapter
+
+        existing = tmp_path / "mimo.bat"
+        existing.write_text("@echo off\necho 1.0\n")
+        adapter = MiMoCodeCLIAdapter(runtime_root=tmp_path, mimo_executable=str(existing))
+        assert adapter._mimo_executable == str(existing)
 
 
 class TestPrepare:
