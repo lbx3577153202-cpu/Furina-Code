@@ -13,8 +13,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import stat as stat_module
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from ..contracts.errors import ContractInvalid
 from .port import (
@@ -44,12 +45,36 @@ def _validate_sandbox_ref(sandbox_path_ref: str) -> None:
     if not sandbox_path_ref:
         raise ContractInvalid("Sandbox ref must not be empty")
     ref_path = Path(sandbox_path_ref)
+    # Cross-platform absolute check
     if ref_path.is_absolute():
+        raise ContractInvalid("Sandbox ref must be relative")
+    if PureWindowsPath(sandbox_path_ref).is_absolute():
+        raise ContractInvalid("Sandbox ref must be relative")
+    # Check for Windows drive letter (C:foo)
+    if len(sandbox_path_ref) >= 2 and sandbox_path_ref[1] == ":":
+        raise ContractInvalid("Sandbox ref must be relative")
+    # Check for UNC paths
+    if sandbox_path_ref.startswith("\\\\") or sandbox_path_ref.startswith("//"):
         raise ContractInvalid("Sandbox ref must be relative")
     if ".." in ref_path.parts:
         raise ContractInvalid("Sandbox ref contains traversal")
     if ref_path == Path("."):
         raise ContractInvalid("Sandbox ref must not be '.'")
+
+
+def _paths_overlap(root_a: Path, root_b: Path) -> bool:
+    """Check if two paths overlap (contain each other or are equal)."""
+    try:
+        root_b.relative_to(root_a)
+        return True
+    except ValueError:
+        pass
+    try:
+        root_a.relative_to(root_b)
+        return True
+    except ValueError:
+        pass
+    return False
 
 
 def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
@@ -77,25 +102,55 @@ def _resolve_sandbox_ref(runtime_root: Path, sandbox_path_ref: str) -> Path:
 # --- Safe file reading ---
 
 def _read_regular_file_once_no_follow(path: Path, max_bytes: int) -> bytes:
-    """Read a file using O_NOFOLLOW where possible, bounded read, identity check."""
+    """Read a file with pre-lstat, O_NOFOLLOW (Unix), identity check, bounded loop, post-read identity check."""
+    # Pre-open lstat check
+    try:
+        pre_stat = os.lstat(str(path))
+    except OSError as exc:
+        raise ContractInvalid(f"File not accessible: {exc}") from exc
+
+    # Reject non-regular files before opening
+    if not stat_module.S_ISREG(pre_stat.st_mode):
+        raise ContractInvalid("Path is not a regular file")
+    if stat_module.S_ISLNK(pre_stat.st_mode):
+        raise ContractInvalid("Path is a symlink")
+
+    # Size check
+    if pre_stat.st_size > max_bytes:
+        raise ContractInvalid(f"File too large: {pre_stat.st_size} bytes")
+
     fd = -1
     try:
-        # Use os.open with O_NOFOLLOW on Unix; on Windows O_NOFOLLOW is ignored
-        # but we already check is_symlink() before calling this
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         fd = os.open(str(path), flags)
-        # fstat to verify identity after open
-        stat = os.fstat(fd)
-        # Verify it's a regular file (S_IFREG)
-        import stat as stat_module
-        if not stat_module.S_ISREG(stat.st_mode):
-            raise ContractInvalid("Path is not a regular file")
-        # Read bounded
-        if stat.st_size > max_bytes:
-            raise ContractInvalid(f"File too large: {stat.st_size} bytes")
-        raw = os.read(fd, stat.st_size)
+
+        # Post-open fstat identity check
+        post_stat = os.fstat(fd)
+        if (post_stat.st_dev, post_stat.st_ino) != (pre_stat.st_dev, pre_stat.st_ino):
+            raise ContractInvalid("File identity changed between lstat and open")
+        if not stat_module.S_ISREG(post_stat.st_mode):
+            raise ContractInvalid("File type changed after open")
+
+        # Bounded read loop
+        chunks: list[bytes] = []
+        remaining = post_stat.st_size
+        while remaining > 0:
+            chunk_size = min(remaining, 65536)
+            chunk = os.read(fd, chunk_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+        raw = b"".join(chunks)
+
+        # Post-read identity check
+        post_read_stat = os.fstat(fd)
+        if (post_read_stat.st_dev, post_read_stat.st_ino) != (pre_stat.st_dev, pre_stat.st_ino):
+            raise ContractInvalid("File identity changed during read")
+
         return raw
     finally:
         if fd >= 0:
@@ -115,6 +170,25 @@ def _ensure_output_dir(sandbox: Path) -> Path:
     else:
         output.mkdir(parents=True, exist_ok=True)
     return output
+
+
+# --- Canonical artifact write ---
+
+def _write_canonical_artifact(path: Path, raw_bytes: bytes) -> None:
+    """Write canonical artifact with exclusive create, complete write loop, fsync."""
+    fd = -1
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        view = memoryview(raw_bytes)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise ContractInvalid("Write returned zero bytes")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 # --- Stable error messages (no paths) ---
@@ -153,41 +227,43 @@ class FileBackend:
         runtime_root: Path,
         forbidden_roots: tuple[Path, ...] = (),
     ) -> None:
-        self._runtime_root = runtime_root.resolve()
-        self._forbidden_roots = tuple(r.resolve() for r in forbidden_roots)
+        self._runtime_root_input = Path(runtime_root)
+        self._forbidden_root_inputs = tuple(Path(p) for p in forbidden_roots)
+        # Resolve only if the raw path is valid; otherwise store raw for probe()
+        self._runtime_root = self._runtime_root_input.resolve()
+        self._forbidden_roots = tuple(r.resolve() for r in self._forbidden_root_inputs)
+
+    def _validate_runtime_root_input(self) -> None:
+        """Validate the raw runtime root input. Returns list of error codes."""
+        errors: list[str] = []
+        raw = self._runtime_root_input
+        if not raw.exists():
+            errors.append("runtime_root_invalid")
+        elif not raw.is_dir():
+            errors.append("runtime_root_invalid")
+        if raw.is_symlink():
+            errors.append("runtime_root_link_rejected")
+        for forbidden in self._forbidden_root_inputs:
+            if _paths_overlap(raw, forbidden):
+                errors.append("runtime_root_forbidden")
+                break
+        return errors
+
+    def _assert_runtime_boundary(self) -> None:
+        """Re-verify runtime boundary at every lifecycle method entry."""
+        errors = self._validate_runtime_root_input()
+        if errors:
+            raise ContractInvalid(errors[0])
 
     def probe(self, request: BackendProbeRequest) -> BackendProbeResult:
         """Probe file backend availability."""
-        errors: list[str] = []
+        errors = self._validate_runtime_root_input()
 
-        # Check runtime root exists and is a directory
-        if not self._runtime_root.exists():
-            errors.append("runtime_root_invalid")
-        elif not self._runtime_root.is_dir():
-            errors.append("runtime_root_invalid")
-
-        # Check runtime root is not a symlink
-        if self._runtime_root.is_symlink():
-            errors.append("runtime_root_link_rejected")
-
-        # Check runtime root is writable
-        if self._runtime_root.exists() and not os.access(str(self._runtime_root), os.W_OK):
-            errors.append("runtime_root_unwritable")
-
-        # Check runtime root is not inside any forbidden root
-        for forbidden in self._forbidden_roots:
-            try:
-                self._runtime_root.relative_to(forbidden)
-                errors.append("runtime_root_forbidden")
-                break
-            except ValueError:
-                pass
-            # Also check if forbidden is inside runtime_root
-            try:
-                forbidden.relative_to(self._runtime_root)
-                # forbidden is inside runtime_root — that's ok for now
-            except ValueError:
-                pass
+        # Additional writability check (only if basic checks passed)
+        raw = self._runtime_root_input
+        if not errors and raw.exists() and raw.is_dir() and not raw.is_symlink():
+            if not os.access(str(raw), os.W_OK):
+                errors.append("runtime_root_unwritable")
 
         return BackendProbeResult(
             available=len(errors) == 0,
@@ -200,6 +276,7 @@ class FileBackend:
 
     def prepare(self, request: BackendInvocationRequest) -> BackendInvocationPlan:
         """Verify request digest, validate sandbox ref, generate plan."""
+        self._assert_runtime_boundary()
         verify_backend_request_digest(request)
         _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
 
@@ -215,6 +292,7 @@ class FileBackend:
 
     def invoke(self, plan: BackendInvocationPlan) -> BackendTransportResult:
         """Check if candidate entry exists and is a safe path type. Does NOT read content."""
+        self._assert_runtime_boundary()
         request = plan.request
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
         candidate_path = sandbox / "candidate.json"
@@ -225,18 +303,6 @@ class FileBackend:
                 request, TransportStatus.SANDBOX_VIOLATION,
                 "candidate_symlink_rejected",
             )
-
-        # Check if it's a junction/reparse point
-        if hasattr(os, "FILE_ATTRIBUTE_REPARSE_POINT") and candidate_path.exists():
-            try:
-                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(candidate_path))
-                if attrs & os.FILE_ATTRIBUTE_REPARSE_POINT:
-                    return self._error_result(
-                        request, TransportStatus.SANDBOX_VIOLATION,
-                        "candidate_symlink_rejected",
-                    )
-            except Exception:
-                pass  # Not Windows or ctypes unavailable
 
         if not candidate_path.exists():
             return self._make_result(request, TransportStatus.AWAITING_EXTERNAL)
@@ -256,6 +322,7 @@ class FileBackend:
         transport: BackendTransportResult,
     ) -> BackendTransportResult:
         """Read external candidate once, form canonical artifact. Protocol-neutral."""
+        self._assert_runtime_boundary()
         if transport.transport_status != TransportStatus.SUCCEEDED.value:
             return transport
 
@@ -265,17 +332,15 @@ class FileBackend:
         output_dir = _ensure_output_dir(sandbox)
 
         # Compute relative candidate_ref from sandbox_path_ref
-        sandbox_ref = request.sandbox_path_ref
-        candidate_ref = f"{sandbox_ref}/output/collected_candidate.json"
+        candidate_ref = f"{request.sandbox_path_ref}/output/collected_candidate.json"
 
         # Check effective size limit
         effective_limit = min(request.max_stdout_bytes, 10 * 1024 * 1024)  # 10 MB
         if effective_limit <= 0:
-            result = self._error_result(
+            return self._error_result(
                 request, TransportStatus.OUTPUT_TOO_LARGE,
                 "candidate_too_large",
             )
-            return result
 
         # Safe single read — no-follow, bounded, identity check
         try:
@@ -292,12 +357,21 @@ class FileBackend:
                     request, TransportStatus.OUTPUT_TOO_LARGE,
                     "candidate_too_large",
                 )
+            if "identity changed" in msg:
+                return self._error_result(
+                    request, TransportStatus.AMBIGUOUS,
+                    "candidate_changed_before_collection",
+                )
+            if "not accessible" in msg or "no such file" in msg:
+                return self._error_result(
+                    request, TransportStatus.AMBIGUOUS,
+                    "candidate_changed_before_collection",
+                )
             return self._error_result(
                 request, TransportStatus.CANDIDATE_REJECTED,
                 "candidate_missing",
             )
         except FileNotFoundError:
-            # Candidate disappeared between invoke and collect
             return self._error_result(
                 request, TransportStatus.AMBIGUOUS,
                 "candidate_changed_before_collection",
@@ -314,28 +388,37 @@ class FileBackend:
         # Write canonical artifact with exclusive create
         canonical_path = output_dir / "collected_candidate.json"
         try:
-            # O_CREAT | O_EXCL — fails if file already exists
-            fd = os.open(str(canonical_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            os.write(fd, raw_bytes)
-            os.close(fd)
+            _write_canonical_artifact(canonical_path, raw_bytes)
         except FileExistsError:
             # Artifact already exists — verify it's the same evidence
-            existing_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
+            try:
+                existing_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
+            except Exception:
+                return self._ambiguous_with_evidence(
+                    request, transport, candidate_ref, candidate_digest,
+                )
             existing_digest = _sha256_bytes(existing_bytes)
             if existing_digest != candidate_digest:
-                return self._error_result(
-                    request, TransportStatus.AMBIGUOUS,
-                    "candidate_evidence_mismatch",
+                return self._ambiguous_with_evidence(
+                    request, transport, candidate_ref, candidate_digest,
                 )
             # Same digest — idempotent reuse, continue
+        except ContractInvalid:
+            return self._ambiguous_with_evidence(
+                request, transport, candidate_ref, candidate_digest,
+            )
 
         # Verify canonical artifact digest
-        canonical_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
+        try:
+            canonical_bytes = _read_regular_file_once_no_follow(canonical_path, effective_limit)
+        except Exception:
+            return self._ambiguous_with_evidence(
+                request, transport, candidate_ref, candidate_digest,
+            )
         canonical_digest = _sha256_bytes(canonical_bytes)
         if canonical_digest != candidate_digest:
-            return self._error_result(
-                request, TransportStatus.AMBIGUOUS,
-                "candidate_evidence_mismatch",
+            return self._ambiguous_with_evidence(
+                request, transport, candidate_ref, candidate_digest,
             )
 
         return dataclasses.replace(
@@ -354,8 +437,28 @@ class FileBackend:
         transport: BackendTransportResult,
     ) -> BackendTransportResult:
         """Validate canonical collected artifact against request bindings."""
+        self._assert_runtime_boundary()
         if transport.transport_status != TransportStatus.SUCCEEDED.value:
             return transport
+
+        # Verify transport candidate_ref binding
+        expected_ref = f"{request.sandbox_path_ref}/output/collected_candidate.json"
+        if transport.candidate_ref != expected_ref:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+                finished_at=_now_iso(),
+            )
+        if not transport.candidate_digest:
+            return dataclasses.replace(
+                transport,
+                transport_status=TransportStatus.AMBIGUOUS.value,
+                error_code="candidate_evidence_mismatch",
+                error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+                finished_at=_now_iso(),
+            )
 
         sandbox = _resolve_sandbox_ref(self._runtime_root, request.sandbox_path_ref)
         canonical_path = sandbox / "output" / "collected_candidate.json"
@@ -430,7 +533,6 @@ class FileBackend:
         request: BackendInvocationRequest,
         status: TransportStatus,
     ) -> BackendTransportResult:
-        sandbox_ref = request.sandbox_path_ref
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
@@ -456,7 +558,6 @@ class FileBackend:
         status: TransportStatus,
         error_code: str,
     ) -> BackendTransportResult:
-        sandbox_ref = request.sandbox_path_ref
         return BackendTransportResult(
             invocation_id=request.invocation_id,
             request_digest=request.request_digest,
@@ -475,6 +576,24 @@ class FileBackend:
             transport_status=status.value,
             error_code=error_code,
             error_detail=_ERROR_MESSAGES.get(error_code, "Unknown error."),
+        )
+
+    def _ambiguous_with_evidence(
+        self,
+        request: BackendInvocationRequest,
+        transport: BackendTransportResult,
+        candidate_ref: str,
+        candidate_digest: str,
+    ) -> BackendTransportResult:
+        """Return ambiguous status while preserving transport evidence."""
+        return dataclasses.replace(
+            transport,
+            candidate_ref=candidate_ref,
+            candidate_digest=candidate_digest,
+            transport_status=TransportStatus.AMBIGUOUS.value,
+            error_code="candidate_evidence_mismatch",
+            error_detail=_ERROR_MESSAGES["candidate_evidence_mismatch"],
+            finished_at=_now_iso(),
         )
 
 
@@ -520,10 +639,3 @@ def _map_error_code(exc: ContractInvalid) -> str:
     if "empty" in msg:
         return "candidate_missing"
     return "candidate_protocol_error"
-
-
-# Conditional import for Windows reparse point detection
-try:
-    import ctypes
-except ImportError:
-    ctypes = None  # type: ignore[assignment]

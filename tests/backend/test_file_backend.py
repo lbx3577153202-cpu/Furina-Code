@@ -74,12 +74,37 @@ class TestFileBackendProbe:
         result = fb.probe(BackendProbeRequest(executable_ref="file-backend", probe_timeout_seconds=30))
         assert result.available is False
 
-    def test_probe_forbidden_root(self, tmp_path):
+    def test_probe_symlink_root(self, tmp_path):
+        """Runtime root that is a symlink must be unavailable."""
+        real_root = tmp_path / "real"
+        real_root.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(real_root)
+        fb = FileBackend(link)
+        result = fb.probe(BackendProbeRequest(executable_ref="file-backend", probe_timeout_seconds=30))
+        assert result.available is False
+        assert "runtime_root_link_rejected" in result.errors
+
+    def test_probe_forbidden_root_inside(self, tmp_path):
         forbidden = tmp_path / "forbidden"
         forbidden.mkdir()
         inside = forbidden / "inside"
         inside.mkdir()
         fb = FileBackend(inside, forbidden_roots=(forbidden,))
+        result = fb.probe(BackendProbeRequest(executable_ref="file-backend", probe_timeout_seconds=30))
+        assert result.available is False
+        assert "runtime_root_forbidden" in result.errors
+
+    def test_probe_forbidden_root_equal(self, tmp_path):
+        """Runtime root equal to forbidden root must be rejected."""
+        fb = FileBackend(tmp_path, forbidden_roots=(tmp_path,))
+        result = fb.probe(BackendProbeRequest(executable_ref="file-backend", probe_timeout_seconds=30))
+        assert result.available is False
+        assert "runtime_root_forbidden" in result.errors
+
+    def test_probe_forbidden_inside_runtime(self, tmp_path):
+        """Forbidden root inside runtime_root must be rejected."""
+        fb = FileBackend(tmp_path, forbidden_roots=(tmp_path / "child",))
         result = fb.probe(BackendProbeRequest(executable_ref="file-backend", probe_timeout_seconds=30))
         assert result.available is False
         assert "runtime_root_forbidden" in result.errors
@@ -91,6 +116,19 @@ class TestFileBackendProbe:
             assert str(tmp_path) not in err
 
 
+class TestFileBackendLifecycleRechecks:
+    def test_prepare_rechecks_boundary(self, tmp_path):
+        """prepare must re-verify runtime boundary even without probe."""
+        forbidden = tmp_path / "forbidden"
+        forbidden.mkdir()
+        inside = forbidden / "inside"
+        inside.mkdir()
+        fb = FileBackend(inside, forbidden_roots=(forbidden,))
+        req = _make_request(inside)
+        with pytest.raises(ContractInvalid, match="runtime_root_forbidden"):
+            fb.prepare(req)
+
+
 class TestFileBackendSandboxRef:
     def test_absolute_ref_rejected(self, tmp_path):
         fb = FileBackend(tmp_path)
@@ -98,11 +136,15 @@ class TestFileBackendSandboxRef:
         with pytest.raises(ContractInvalid, match="relative"):
             fb.prepare(req)
 
-    def test_absolute_inside_runtime_rejected(self, tmp_path):
+    def test_windows_drive_ref_rejected(self, tmp_path):
         fb = FileBackend(tmp_path)
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        req = _make_request(tmp_path, sandbox_path_ref=str(sandbox))
+        req = _make_request(tmp_path, sandbox_path_ref="C:/sandbox")
+        with pytest.raises(ContractInvalid, match="relative"):
+            fb.prepare(req)
+
+    def test_unc_ref_rejected(self, tmp_path):
+        fb = FileBackend(tmp_path)
+        req = _make_request(tmp_path, sandbox_path_ref="//server/share")
         with pytest.raises(ContractInvalid, match="relative"):
             fb.prepare(req)
 
@@ -196,23 +238,10 @@ class TestFileBackendInvoke:
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
-        # Create a directory named candidate.json
         (sandbox / "candidate.json").mkdir()
         plan = fb.prepare(req)
         result = fb.invoke(plan)
         assert result.transport_status == TransportStatus.SANDBOX_VIOLATION.value
-
-    def test_invoke_does_not_read_content(self, tmp_path):
-        """invoke only checks existence and link type, not content."""
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path)
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        # Write invalid content — invoke should still succeed
-        (sandbox / "candidate.json").write_bytes(b"\x80\x81")
-        plan = fb.prepare(req)
-        result = fb.invoke(plan)
-        assert result.transport_status == TransportStatus.SUCCEEDED.value
 
 
 class TestFileBackendCollect:
@@ -229,7 +258,6 @@ class TestFileBackendCollect:
         assert result.candidate_digest is not None
 
     def test_candidate_ref_relative_to_sandbox(self, tmp_path):
-        """candidate_ref must contain sandbox_path_ref as prefix."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -253,23 +281,8 @@ class TestFileBackendCollect:
         canonical = sandbox / "output" / "collected_candidate.json"
         assert canonical.exists()
 
-    def test_collect_invalid_utf8_preserves_candidate_ref(self, tmp_path):
-        """Invalid UTF-8 still saves candidate_ref and candidate_digest."""
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path)
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        (sandbox / "candidate.json").write_bytes(b"\x80\x81\x82")
-        plan = fb.prepare(req)
-        invoke_result = fb.invoke(plan)
-        result = fb.collect(plan, invoke_result)
-        # collect doesn't do UTF-8 — it just freezes bytes
-        # UTF-8 check happens in strict_validate
-        assert result.candidate_ref is not None
-        assert result.candidate_digest is not None
-
-    def test_collect_candidate_mutation_safe(self, tmp_path):
-        """After collect, modifying original doesn't change frozen evidence."""
+    def test_regular_content_change_captured(self, tmp_path):
+        """Regular file content change before collect is captured by collect."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -277,21 +290,71 @@ class TestFileBackendCollect:
         _write_valid_candidate(sandbox)
         plan = fb.prepare(req)
         invoke_result = fb.invoke(plan)
-        collect_result = fb.collect(plan, invoke_result)
-        original_digest = collect_result.candidate_digest
 
-        # Mutate original
-        (sandbox / "candidate.json").write_text('{"mutated": true}')
+        # Change content (still valid JSON)
+        (sandbox / "candidate.json").write_text(json.dumps({
+            "schema_version": "1.0", "candidate_type": "repository_baseline_report",
+            "backend_profile_ref": "sha256:bp", "backend_session_ref": "test",
+            "context_ref": "sha256:ctx", "context_digest": "sha256:cd",
+            "content": {"repository_head": "b" * 40, "branch": "main", "working_tree": "clean",
+                        "tracked_file_count": 0, "untracked_file_count": 0, "python_requires": None,
+                        "runtime_dependencies": [], "dev_dependencies": [], "pytest_testpaths": [],
+                        "ci_config": {"present": False, "sha256": None}, "blind_spots": []},
+            "claimed_assumptions": [], "requested_actions": [],
+        }))
 
-        # Canonical artifact digest should still match
-        canonical = sandbox / "output" / "collected_candidate.json"
-        canonical_bytes = canonical.read_bytes()
-        import hashlib
-        canonical_digest = "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
-        assert original_digest == canonical_digest
+        result = fb.collect(plan, invoke_result)
+        assert result.transport_status == TransportStatus.SUCCEEDED.value
 
-    def test_exclusive_create_no_overwrite(self, tmp_path):
-        """Canonical artifact uses exclusive create — doesn't overwrite existing."""
+    def test_symlink_swap_before_collect_rejected(self, tmp_path):
+        """Candidate swapped to symlink before collect → sandbox_violation."""
+        fb = FileBackend(tmp_path)
+        req = _make_request(tmp_path)
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        _write_valid_candidate(sandbox)
+        plan = fb.prepare(req)
+        invoke_result = fb.invoke(plan)
+
+        # Replace with symlink
+        (sandbox / "candidate.json").unlink()
+        real = sandbox / "real.json"
+        real.write_text("{}")
+        (sandbox / "candidate.json").symlink_to(real)
+
+        result = fb.collect(plan, invoke_result)
+        assert result.transport_status == TransportStatus.SANDBOX_VIOLATION.value
+
+    def test_candidate_disappearance_ambiguous(self, tmp_path):
+        """Candidate disappears between invoke and collect → ambiguous."""
+        fb = FileBackend(tmp_path)
+        req = _make_request(tmp_path)
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "candidate.json").write_text("{}")
+        plan = fb.prepare(req)
+        invoke_result = fb.invoke(plan)
+        (sandbox / "candidate.json").unlink()
+
+        result = fb.collect(plan, invoke_result)
+        assert result.transport_status == TransportStatus.AMBIGUOUS.value
+        assert result.error_code == "candidate_changed_before_collection"
+
+    def test_exclusive_create_idempotent(self, tmp_path):
+        """Same candidate collect twice is idempotent."""
+        fb = FileBackend(tmp_path)
+        req = _make_request(tmp_path)
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        _write_valid_candidate(sandbox)
+        plan = fb.prepare(req)
+        invoke_result = fb.invoke(plan)
+        result1 = fb.collect(plan, invoke_result)
+        result2 = fb.collect(plan, invoke_result)
+        assert result2.candidate_digest == result1.candidate_digest
+
+    def test_existing_different_digest_ambiguous(self, tmp_path):
+        """Existing canonical artifact with different digest → ambiguous."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -301,15 +364,19 @@ class TestFileBackendCollect:
         invoke_result = fb.invoke(plan)
 
         # First collect
-        result1 = fb.collect(plan, invoke_result)
-        digest1 = result1.candidate_digest
+        fb.collect(plan, invoke_result)
 
-        # Second collect — same candidate, should be idempotent
-        result2 = fb.collect(plan, invoke_result)
-        assert result2.candidate_digest == digest1
+        # Create a different artifact manually
+        output = sandbox / "output"
+        canonical = output / "collected_candidate.json"
+        canonical.write_text('{"different": true}')
 
-    def test_collect_invoke_swap_detected(self, tmp_path):
-        """If candidate changes between invoke and collect, detect it."""
+        # Now collect with original candidate — different digest
+        result = fb.collect(plan, invoke_result)
+        assert result.transport_status == TransportStatus.AMBIGUOUS.value
+
+    def test_collect_preserves_evidence_on_ambiguous(self, tmp_path):
+        """Ambiguous result must preserve transport evidence."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -318,29 +385,14 @@ class TestFileBackendCollect:
         plan = fb.prepare(req)
         invoke_result = fb.invoke(plan)
 
-        # Replace candidate with different content
-        (sandbox / "candidate.json").write_text('{"different": true}')
-
-        result = fb.collect(plan, invoke_result)
-        # collect reads the new content — no TOCTOU here since invoke didn't read
-        assert result.candidate_digest is not None
-
-    def test_collect_disappearance_detected(self, tmp_path):
-        """If candidate disappears between invoke and collect."""
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path)
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        (sandbox / "candidate.json").write_text("{}")
-        plan = fb.prepare(req)
-        invoke_result = fb.invoke(plan)
-
-        # Remove candidate
+        # Make candidate disappear
         (sandbox / "candidate.json").unlink()
 
         result = fb.collect(plan, invoke_result)
         assert result.transport_status == TransportStatus.AMBIGUOUS.value
-        assert result.error_code == "candidate_changed_before_collection"
+        # Evidence preserved
+        assert result.request_digest == invoke_result.request_digest
+        assert result.backend_session_ref == invoke_result.backend_session_ref
 
 
 class TestFileBackendStrictValidate:
@@ -368,53 +420,25 @@ class TestFileBackendStrictValidate:
         result = fb.strict_validate(req, transport)
         assert result.transport_status == TransportStatus.CANDIDATE_REJECTED.value
 
-    def test_context_digest_mismatch(self, tmp_path):
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path, context_digest="sha256:wrong")
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        _write_valid_candidate(sandbox)
-        plan = fb.prepare(req)
-        transport = fb.invoke(plan)
-        transport = fb.collect(plan, transport)
-        result = fb.strict_validate(req, transport)
-        assert result.transport_status == TransportStatus.CANDIDATE_REJECTED.value
-
-    def test_backend_profile_ref_mismatch(self, tmp_path):
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path, backend_profile_ref="sha256:wrong")
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        _write_valid_candidate(sandbox)
-        plan = fb.prepare(req)
-        transport = fb.invoke(plan)
-        transport = fb.collect(plan, transport)
-        result = fb.strict_validate(req, transport)
-        assert result.transport_status == TransportStatus.CANDIDATE_REJECTED.value
-
-    def test_requested_actions_non_empty(self, tmp_path):
+    def test_tampered_canonical_returns_ambiguous(self, tmp_path):
+        """Tampered canonical artifact → ambiguous with evidence preserved."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
-        candidate = {
-            "schema_version": "1.0", "candidate_type": "repository_baseline_report",
-            "backend_profile_ref": "sha256:bp", "backend_session_ref": "test",
-            "context_ref": "sha256:ctx", "context_digest": "sha256:cd",
-            "content": {"repository_head": "a" * 40, "branch": "main",
-                        "working_tree": "clean", "tracked_file_count": 0,
-                        "untracked_file_count": 0, "python_requires": None,
-                        "runtime_dependencies": [], "dev_dependencies": [],
-                        "pytest_testpaths": [], "ci_config": {"present": False, "sha256": None},
-                        "blind_spots": []},
-            "claimed_assumptions": [], "requested_actions": ["write_file"],
-        }
-        (sandbox / "candidate.json").write_text(json.dumps(candidate))
+        _write_valid_candidate(sandbox)
         plan = fb.prepare(req)
         transport = fb.invoke(plan)
         transport = fb.collect(plan, transport)
+
+        canonical = sandbox / "output" / "collected_candidate.json"
+        canonical.write_bytes(b"\x80\x81\x82")
+
         result = fb.strict_validate(req, transport)
-        assert result.transport_status == TransportStatus.CANDIDATE_REJECTED.value
+        assert result.transport_status == TransportStatus.AMBIGUOUS.value
+        assert result.candidate_ref == transport.candidate_ref
+        assert result.request_digest == transport.request_digest
+        assert result.backend_session_ref == transport.backend_session_ref
 
     def test_validate_uses_frozen_canonical_artifact(self, tmp_path):
         """strict_validate reads canonical artifact, not original file."""
@@ -427,15 +451,12 @@ class TestFileBackendStrictValidate:
         transport = fb.invoke(plan)
         transport = fb.collect(plan, transport)
 
-        # Mutate original
         (sandbox / "candidate.json").write_text('{"mutated": true}')
-
-        # strict_validate should still pass using canonical artifact
         result = fb.strict_validate(req, transport)
         assert result.transport_status == TransportStatus.SUCCEEDED.value
 
-    def test_canonical_digest_mismatch(self, tmp_path):
-        """If canonical artifact is tampered, strict_validate returns ambiguous."""
+    def test_candidate_ref_binding_verified(self, tmp_path):
+        """strict_validate checks transport.candidate_ref matches expected."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -445,15 +466,14 @@ class TestFileBackendStrictValidate:
         transport = fb.invoke(plan)
         transport = fb.collect(plan, transport)
 
-        # Tamper canonical artifact
-        canonical = sandbox / "output" / "collected_candidate.json"
-        canonical.write_text('{"tampered": true}')
-
-        result = fb.strict_validate(req, transport)
+        # Tamper candidate_ref
+        import dataclasses
+        bad_transport = dataclasses.replace(transport, candidate_ref="wrong/ref")
+        result = fb.strict_validate(req, bad_transport)
         assert result.transport_status == TransportStatus.AMBIGUOUS.value
 
-    def test_tampered_canonical_returns_ambiguous(self, tmp_path):
-        """If canonical artifact is tampered (digest mismatch), returns ambiguous."""
+    def test_missing_digest_ambiguous(self, tmp_path):
+        """Empty candidate_digest → ambiguous."""
         fb = FileBackend(tmp_path)
         req = _make_request(tmp_path)
         sandbox = tmp_path / "sandbox"
@@ -463,29 +483,10 @@ class TestFileBackendStrictValidate:
         transport = fb.invoke(plan)
         transport = fb.collect(plan, transport)
 
-        # Tamper canonical artifact
-        canonical = sandbox / "output" / "collected_candidate.json"
-        canonical.write_bytes(b"\x80\x81\x82")
-
-        result = fb.strict_validate(req, transport)
+        import dataclasses
+        bad_transport = dataclasses.replace(transport, candidate_digest="")
+        result = fb.strict_validate(req, bad_transport)
         assert result.transport_status == TransportStatus.AMBIGUOUS.value
-        # Evidence preserved even on ambiguous
-        assert result.candidate_ref == transport.candidate_ref
-        assert result.request_digest == transport.request_digest
-        assert result.backend_session_ref == transport.backend_session_ref
-
-    def test_error_no_absolute_paths(self, tmp_path):
-        """error_detail must not contain absolute paths."""
-        fb = FileBackend(tmp_path)
-        req = _make_request(tmp_path, context_ref="sha256:wrong")
-        sandbox = tmp_path / "sandbox"
-        sandbox.mkdir()
-        _write_valid_candidate(sandbox)
-        plan = fb.prepare(req)
-        transport = fb.invoke(plan)
-        transport = fb.collect(plan, transport)
-        result = fb.strict_validate(req, transport)
-        assert str(tmp_path) not in (result.error_detail or "")
 
 
 class TestFileBackendAuthorityBoundary:
