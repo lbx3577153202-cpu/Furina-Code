@@ -100,6 +100,7 @@ def _payload(obj: Any) -> dict[str, Any]:
             "expected_diff": obj.expected_diff, "risk": obj.risk,
             "rollback_or_compensation": obj.rollback_or_compensation,
             "preconditions": list(obj.preconditions),
+            "experience_match_ref": obj.experience_match_ref,
         }
     if isinstance(obj, AuthorizationDecision):
         return {
@@ -181,6 +182,7 @@ def _payload(obj: Any) -> dict[str, Any]:
             "residual_risks": list(obj.residual_risks),
             "no_project_side_effect": obj.no_project_side_effect,
             "user_effect": obj.user_effect,
+            "action_plan_ref": obj.action_plan_ref,
         }
     raise ContractInvalid(f"Unsupported E5 object: {type(obj).__name__}")
 
@@ -215,9 +217,6 @@ def bind_single_file_create(
         raise ContractInvalid("E5 content must not be empty")
     if not _allowed_target_path(target_path):
         raise ContractInvalid("E5 target must be one .txt file directly within notes/")
-    preconditions = ["baseline_clean", "target_absent"]
-    if experience_match_ref:
-        preconditions.append(f"experience_match:{experience_match_ref}")
     return BoundActionPlan.create(
         run_binding_id=snapshot.meta.run_binding_id,
         task_id=snapshot.meta.task_id,
@@ -233,7 +232,8 @@ def bind_single_file_create(
         expected_diff={"created_path": target_path, "content_sha256": _content_sha256(content)},
         risk="low",
         rollback_or_compensation="remove only the created target after a new authorization",
-        preconditions=tuple(preconditions),
+        preconditions=("baseline_clean", "target_absent"),
+        experience_match_ref=experience_match_ref,
         causation_ref=snapshot.meta.integrity_ref,
     )
 
@@ -553,6 +553,7 @@ def adjudicate_single_file_completion(
         residual_risks=("recovery and experience are outside E5",),
         no_project_side_effect=False,
         user_effect=f"created {plan.expected_diff['created_path']}" if verification.outcome == "pass" else "no completion claim",
+        action_plan_ref=plan.meta.integrity_ref,
         causation_ref=verification.meta.integrity_ref,
     )
     write_e5_object(ledger, completion, 0)

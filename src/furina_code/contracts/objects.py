@@ -915,6 +915,7 @@ class BoundActionPlan:
     risk: str
     rollback_or_compensation: str
     preconditions: tuple[str, ...]
+    experience_match_ref: str | None
 
     def __post_init__(self) -> None:
         _check_object_type(self, "BoundActionPlan")
@@ -931,6 +932,7 @@ class BoundActionPlan:
         target_scope: tuple[str, ...], operations: tuple[dict[str, Any], ...],
         expected_diff: dict[str, Any], risk: str,
         rollback_or_compensation: str, preconditions: tuple[str, ...],
+        experience_match_ref: str | None = None,
         plan_id: str | None = None, causation_ref: str | None = None,
     ) -> BoundActionPlan:
         payload = {
@@ -941,6 +943,7 @@ class BoundActionPlan:
             "expected_diff": expected_diff, "risk": risk,
             "rollback_or_compensation": rollback_or_compensation,
             "preconditions": list(preconditions),
+            "experience_match_ref": experience_match_ref,
         }
         oid = plan_id or f"{task_id}:action-plan:1"
         meta, _ = _build_meta_and_integrity(
@@ -949,7 +952,8 @@ class BoundActionPlan:
         )
         return BoundActionPlan(meta, candidate_ref, task_revision, baseline_snapshot_ref,
                                baseline_snapshot_sha256, target_scope, operations,
-                               expected_diff, risk, rollback_or_compensation, preconditions)
+                               expected_diff, risk, rollback_or_compensation, preconditions,
+                               experience_match_ref)
 
 
 @dataclass(frozen=True)
@@ -1431,6 +1435,7 @@ class CompletionVerdict:
     residual_risks: tuple[str, ...]
     no_project_side_effect: bool
     user_effect: str
+    action_plan_ref: str | None
 
     def __post_init__(self) -> None:
         _check_object_type(self, "CompletionVerdict")
@@ -1459,6 +1464,7 @@ class CompletionVerdict:
         no_project_side_effect: bool = True,
         user_effect: str = "",
         reconciliation_refs: tuple[str, ...] = (),
+        action_plan_ref: str | None = None,
         envelope_id: str | None = None,
         causation_ref: str | None = None,
     ) -> CompletionVerdict:
@@ -1475,6 +1481,7 @@ class CompletionVerdict:
             "residual_risks": list(residual_risks),
             "no_project_side_effect": no_project_side_effect,
             "user_effect": user_effect,
+            "action_plan_ref": action_plan_ref,
         }
         oid = envelope_id or f"{task_id}:cverdict:1"
         meta, _ = _build_meta_and_integrity(
@@ -1492,7 +1499,7 @@ class CompletionVerdict:
             unverified_items=unverified_items,
             residual_risks=residual_risks,
             no_project_side_effect=no_project_side_effect,
-            user_effect=user_effect,
+            user_effect=user_effect, action_plan_ref=action_plan_ref,
         )
 
     def supersede_for_reality_change(self, verification_ref: str, reason: str) -> CompletionVerdict:
@@ -1506,6 +1513,7 @@ class CompletionVerdict:
             "unverified_items": list(self.completed_items),
             "residual_risks": [reason], "no_project_side_effect": self.no_project_side_effect,
             "user_effect": "previous completion superseded after project reality changed",
+            "action_plan_ref": self.action_plan_ref,
         }
         return CompletionVerdict(
             meta=_revise_meta(self.meta, payload), task_revision=self.task_revision,
@@ -1515,6 +1523,7 @@ class CompletionVerdict:
             incomplete_items=self.completed_items, unverified_items=self.completed_items,
             residual_risks=(reason,), no_project_side_effect=self.no_project_side_effect,
             user_effect="previous completion superseded after project reality changed",
+            action_plan_ref=self.action_plan_ref,
         )
 
 

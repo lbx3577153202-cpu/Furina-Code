@@ -67,10 +67,12 @@ def test_initial_loop_completes_two_independent_controlled_tasks_and_conditional
     assert (second_repo / "notes" / "greeting.txt").read_bytes() == b"A distinct second task.\n"
     assert second.plan.expected_diff["created_path"] != first.plan.expected_diff["created_path"]
 
-    # Verify the experience match ref is embedded in the second plan
-    assert any("experience_match:" in p for p in second.plan.preconditions)
+    # Verify the experience match ref is a formal field in the second plan
+    assert second.plan.experience_match_ref == match.meta.integrity_ref
+    # Verify the completion references the plan
+    assert second.completion.action_plan_ref == second.plan.meta.integrity_ref
 
-    trial = record_trial_use(experience, match, second.completion)
+    trial = record_trial_use(experience, match, second.plan, second.completion)
     write_experience_object(ledger, trial, 0)
     lifecycle = adjudicate_trial(experience, trial)
     write_experience_object(ledger, lifecycle, 0)
@@ -157,13 +159,14 @@ def test_e7_trial_rejects_cross_task_match(tmp_path):
         project_ref="project-other", correlation_id="corr-other", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
+    plan = _make_plan("task-other", match_ref=match.meta.integrity_ref)
     # Completion from a THIRD task — different project, but same task_id, run, and correlation
     completion = _make_completion("task-other", "completed",
                                  project="project-diff", task_run_id="run-other",
-                                 correlation_id="corr-other")
+                                 correlation_id="corr-other", plan_ref=plan.meta.integrity_ref)
 
     with pytest.raises(ContractInvalid, match="same project"):
-        record_trial_use(experience, match, completion)
+        record_trial_use(experience, match, plan, completion)
 
 
 def test_e7_trial_rejects_mismatched_revision(tmp_path):
@@ -176,11 +179,33 @@ def test_e7_trial_rejects_mismatched_revision(tmp_path):
         project_ref="project-x", correlation_id="corr-x", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
+    plan = _make_plan("task-x2", match_ref=match.meta.integrity_ref)
     completion = _make_completion("task-x2", "completed", task_run_id="run-x2",
-                                 correlation_id="corr-x", project="project-x", task_revision=2)
+                                 correlation_id="corr-x", project="project-x",
+                                 task_revision=2, plan_ref=plan.meta.integrity_ref)
 
     with pytest.raises(ContractInvalid, match="task revision"):
-        record_trial_use(experience, match, completion)
+        record_trial_use(experience, match, plan, completion)
+
+
+def test_e7_trial_rejects_completion_without_plan_binding(tmp_path):
+    """Regression: even with matching task/run/project, completion without plan binding is rejected."""
+    experience = extract_completed_write_experience(
+        _make_completion("task-no-plan", "completed")
+    )
+    match = match_experience_for_second_task(
+        experience, run_binding_id="rb-no-plan", task_id="task-no-plan2", task_run_id="run-no-plan2",
+        project_ref="project-no-plan", correlation_id="corr-no-plan", task_revision=1,
+        target_scope=("notes/",), risk="low",
+    )
+    plan = _make_plan("task-no-plan2", match_ref=match.meta.integrity_ref)
+    # Completion does NOT reference the plan (action_plan_ref=None)
+    completion = _make_completion("task-no-plan2", "completed", task_run_id="run-no-plan2",
+                                 correlation_id="corr-no-plan", project="project-no-plan",
+                                 plan_ref=None)
+
+    with pytest.raises(ContractInvalid, match="action plan"):
+        record_trial_use(experience, match, plan, completion)
 
 
 def test_e7_second_round_never_reusable(tmp_path):
@@ -193,9 +218,11 @@ def test_e7_second_round_never_reusable(tmp_path):
         project_ref="project-y", correlation_id="corr-y", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
+    plan = _make_plan("task-y2", match_ref=match.meta.integrity_ref)
     completion = _make_completion("task-y2", "completed", task_run_id="run-y2",
-                                 correlation_id="corr-y", project="project-y")
-    trial = record_trial_use(experience, match, completion)
+                                 correlation_id="corr-y", project="project-y",
+                                 plan_ref=plan.meta.integrity_ref)
+    trial = record_trial_use(experience, match, plan, completion)
     lifecycle = adjudicate_trial(experience, trial)
     assert lifecycle.new_status == "conditional"
     assert lifecycle.new_status != "reusable"
@@ -211,16 +238,35 @@ def test_e7_failed_second_round_degrades(tmp_path):
         project_ref="project-z", correlation_id="corr-z", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
+    plan = _make_plan("task-z2", match_ref=match.meta.integrity_ref)
     completion = _make_completion("task-z2", "not_completed", task_run_id="run-z2",
-                                 correlation_id="corr-z", project="project-z")
-    trial = record_trial_use(experience, match, completion)
+                                 correlation_id="corr-z", project="project-z",
+                                 plan_ref=plan.meta.integrity_ref)
+    trial = record_trial_use(experience, match, plan, completion)
     lifecycle = adjudicate_trial(experience, trial)
     assert lifecycle.new_status == "degraded"
 
 
+def _make_plan(task_id: str, match_ref: str | None = None):
+    from furina_code.contracts import BoundActionPlan
+    return BoundActionPlan.create(
+        run_binding_id=f"rb-{task_id}", task_id=task_id, task_run_id=f"run-{task_id}",
+        project_ref="project-1", correlation_id=f"corr-{task_id}",
+        candidate_ref="candidate:test", task_revision=1,
+        baseline_snapshot_ref="sha256:snapshot", baseline_snapshot_sha256="sha256:abc",
+        target_scope=("notes/",),
+        operations=({"kind": "create_file", "path": "notes/test.txt", "content": "test\n"},),
+        expected_diff={"created_path": "notes/test.txt", "content_sha256": "sha256:test"},
+        risk="low", rollback_or_compensation="remove file",
+        preconditions=("baseline_clean", "target_absent"),
+        experience_match_ref=match_ref,
+    )
+
+
 def _make_completion(task_id: str, outcome: str = "completed", *,
                      project: str = "project-1", task_revision: int = 1,
-                     task_run_id: str | None = None, correlation_id: str | None = None):
+                     task_run_id: str | None = None, correlation_id: str | None = None,
+                     plan_ref: str | None = None):
     from furina_code.contracts import CompletionVerdict
     run_id = task_run_id or f"run-{task_id}"
     corr_id = correlation_id or f"corr-{task_id}"
@@ -231,5 +277,5 @@ def _make_completion(task_id: str, outcome: str = "completed", *,
         candidate_ref="candidate:controlled-write", outcome=outcome,
         completed_items=("controlled write",) if outcome == "completed" else (),
         incomplete_items=("controlled write",) if outcome != "completed" else (),
-        no_project_side_effect=False,
+        no_project_side_effect=False, action_plan_ref=plan_ref,
     )

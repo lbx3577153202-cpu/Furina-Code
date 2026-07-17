@@ -142,7 +142,8 @@ def _payload_from_obj(obj) -> dict:
                 "incomplete_items": list(obj.incomplete_items),
                 "unverified_items": list(obj.unverified_items),
                 "residual_risks": list(obj.residual_risks),
-                "no_project_side_effect": obj.no_project_side_effect, "user_effect": obj.user_effect}
+                "no_project_side_effect": obj.no_project_side_effect, "user_effect": obj.user_effect,
+                "action_plan_ref": obj.action_plan_ref}
     raise ValueError(f"Unknown object type: {t}")
 
 

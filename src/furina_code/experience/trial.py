@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from ..contracts import (
+    BoundActionPlan,
     CompletionVerdict,
     ContractInvalid,
     ExperienceCandidate,
@@ -37,6 +38,17 @@ def _payload(obj: Any) -> dict[str, Any]:
             "experience_ref": obj.experience_ref, "task_revision": obj.task_revision,
             "usage_mode": obj.usage_mode, "influence_ref": obj.influence_ref,
             "completion_ref": obj.completion_ref, "result": obj.result,
+        }
+    if isinstance(obj, BoundActionPlan):
+        return {
+            "candidate_ref": obj.candidate_ref, "task_revision": obj.task_revision,
+            "baseline_snapshot_ref": obj.baseline_snapshot_ref,
+            "baseline_snapshot_sha256": obj.baseline_snapshot_sha256,
+            "target_scope": list(obj.target_scope), "operations": list(obj.operations),
+            "expected_diff": obj.expected_diff, "risk": obj.risk,
+            "rollback_or_compensation": obj.rollback_or_compensation,
+            "preconditions": list(obj.preconditions),
+            "experience_match_ref": obj.experience_match_ref,
         }
     if isinstance(obj, ExperienceLifecycleVerdict):
         return {
@@ -116,14 +128,29 @@ def match_experience_for_second_task(
 def record_trial_use(
     experience: ExperienceCandidate,
     match: ExperienceMatch,
+    plan: BoundActionPlan,
     completion: CompletionVerdict,
 ) -> TrialUseRecord:
+    """Record a trial use with full causal chain validation.
+
+    The chain must be: experience -> match -> plan -> completion.
+    """
+    # 1. Experience must be in match.candidate_refs
     if not match.candidate_refs or experience.meta.integrity_ref not in match.candidate_refs:
         raise ContractInvalid("Trial use requires a matching conditional recommendation")
+    # 2. Must be a second task, not the source task
     if completion.meta.task_id == experience.meta.task_id:
         raise ContractInvalid("Trial use must be a second task, not the source task")
-    # Causal chain validation: match, completion, and experience must share
-    # the same second-round task identity (task, run, project, correlation).
+    # 3. Plan must carry the experience_match_ref
+    if not plan.experience_match_ref:
+        raise ContractInvalid("Plan must carry an experience_match_ref to enable trial use")
+    # 4. Plan's experience_match_ref must match the match's integrity ref
+    if plan.experience_match_ref != match.meta.integrity_ref:
+        raise ContractInvalid("Plan's experience_match_ref must match the match's integrity ref")
+    # 5. Completion must reference the plan
+    if completion.action_plan_ref != plan.meta.integrity_ref:
+        raise ContractInvalid("Completion must reference the executed action plan")
+    # 6. Causal chain: match, completion, and plan must share the same task identity
     if match.meta.task_id != completion.meta.task_id:
         raise ContractInvalid("Match and completion must belong to the same second-round task")
     if match.meta.task_run_id != completion.meta.task_run_id:
@@ -134,9 +161,9 @@ def record_trial_use(
         raise ContractInvalid("Match and completion must share the same correlation")
     if match.task_revision != completion.task_revision:
         raise ContractInvalid("Match and completion must reference the same task revision")
-    # Verify the experience ref is consistent between match and experience
-    if experience.meta.integrity_ref not in match.candidate_refs:
-        raise ContractInvalid("Experience ref in match must match the experience being trialed")
+    # 7. Plan must belong to the same task
+    if plan.meta.task_id != completion.meta.task_id:
+        raise ContractInvalid("Plan must belong to the same task as completion")
     result = "completed" if completion.outcome == "completed" else "not_completed"
     return TrialUseRecord.create(
         run_binding_id=completion.meta.run_binding_id, task_id=completion.meta.task_id,

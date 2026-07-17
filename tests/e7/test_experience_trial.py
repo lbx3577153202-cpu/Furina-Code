@@ -2,7 +2,7 @@
 
 import pytest
 
-from furina_code.contracts import AuthorityViolation, CompletionVerdict
+from furina_code.contracts import AuthorityViolation, BoundActionPlan, CompletionVerdict
 from furina_code.experience import (
     adjudicate_trial,
     extract_completed_write_experience,
@@ -13,9 +13,25 @@ from furina_code.experience import (
 from furina_code.ledger import Ledger
 
 
+def _plan(task_id: str, match_ref: str | None = None) -> BoundActionPlan:
+    return BoundActionPlan.create(
+        run_binding_id=f"rb-{task_id}", task_id=task_id, task_run_id=f"run-{task_id}",
+        project_ref="project-1", correlation_id=f"corr-{task_id}",
+        candidate_ref="candidate:test", task_revision=1,
+        baseline_snapshot_ref="sha256:snapshot", baseline_snapshot_sha256="sha256:abc",
+        target_scope=("notes/",),
+        operations=({"kind": "create_file", "path": "notes/test.txt", "content": "test\n"},),
+        expected_diff={"created_path": "notes/test.txt", "content_sha256": "sha256:test"},
+        risk="low", rollback_or_compensation="remove file",
+        preconditions=("baseline_clean", "target_absent"),
+        experience_match_ref=match_ref,
+    )
+
+
 def _completion(task_id: str, outcome: str = "completed", *,
                 task_run_id: str | None = None, correlation_id: str | None = None,
-                project: str = "project-1", task_revision: int = 1) -> CompletionVerdict:
+                project: str = "project-1", task_revision: int = 1,
+                plan_ref: str | None = None) -> CompletionVerdict:
     run_id = task_run_id or f"run-{task_id}"
     corr_id = correlation_id or f"corr-{task_id}"
     return CompletionVerdict.create(
@@ -25,7 +41,7 @@ def _completion(task_id: str, outcome: str = "completed", *,
         candidate_ref="candidate:controlled-write", outcome=outcome,
         completed_items=("controlled write",) if outcome == "completed" else (),
         incomplete_items=("controlled write",) if outcome != "completed" else (),
-        no_project_side_effect=False,
+        no_project_side_effect=False, action_plan_ref=plan_ref,
     )
 
 
@@ -42,8 +58,10 @@ def test_independent_second_task_turns_candidate_into_conditional_experience(tmp
         target_scope=("notes/",), risk="low",
     )
     write_experience_object(ledger, match, 0)
-    second = _completion("task-two", task_run_id="run-two", correlation_id="corr-two")
-    trial = record_trial_use(experience, match, second)
+    plan = _plan("task-two", match_ref=match.meta.integrity_ref)
+    second = _completion("task-two", task_run_id="run-two", correlation_id="corr-two",
+                         plan_ref=plan.meta.integrity_ref)
+    trial = record_trial_use(experience, match, plan, second)
     write_experience_object(ledger, trial, 0)
     lifecycle = adjudicate_trial(experience, trial)
     write_experience_object(ledger, lifecycle, 0)
@@ -75,8 +93,11 @@ def test_failed_second_task_degrades_instead_of_promoting_experience():
         project_ref="project-1", correlation_id="corr-two", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
-    trial = record_trial_use(experience, match, _completion("task-two", "not_completed",
-                                                           task_run_id="run-two", correlation_id="corr-two"))
+    plan = _plan("task-two", match_ref=match.meta.integrity_ref)
+    trial = record_trial_use(experience, match, plan,
+                             _completion("task-two", "not_completed",
+                                         task_run_id="run-two", correlation_id="corr-two",
+                                         plan_ref=plan.meta.integrity_ref))
 
     assert adjudicate_trial(experience, trial).new_status == "degraded"
 
