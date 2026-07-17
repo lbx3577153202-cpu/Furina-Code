@@ -56,7 +56,14 @@ STATUS_RE = re.compile(r"status:\s*(\S+)")
 # Frozen files and their expected SHA-256 hashes.
 # These MUST NOT be silently changed; if both the file and SHA256SUMS are
 # altered simultaneously, the anti-tamper check catches it.
-FROZEN_EXPECTED_HASHES: dict[str, str] = {}
+FROZEN_EXPECTED_HASHES: dict[str, str] = {
+    "11_FORMAL_BASIS/01_FURINA_CODE_INITIAL_LOOP_ESTABLISHMENT_CRITERIA_V0.2_FROZEN.md": "10569b18915ad7069dc33f0f32e9d8bb1e4de58d7f7ee76c589016758e843e2b",
+    "11_FORMAL_BASIS/02_FURINA_CODE_MATURITY_ESTABLISHMENT_DEFINITION_V0.2_FROZEN.md": "adbe449baf3ae8a7f8c3cc5181cbb098b101c0c27ab2d552047799af7c6919d4",
+    "11_FORMAL_BASIS/03_FURINA_CODE_MATURITY_ESTABLISHMENT_CRITERIA_V0.2_FROZEN.md": "64e72d805965b139bb4093c65a7d006bf5bb554368d8fae695956ea63f7630ef",
+    "11_FORMAL_BASIS/04_FURINA_CODE_MATURE_NINE_SYSTEMS_AUTHORITY_ISOLATION_CONSTITUTION_V0.2_FROZEN.md": "ca1558f832e2ca8cabab5bc4e954dfabe0fc8734a3e99ea5df7204dbda3ca904",
+    "30_ACTIVE_DESIGN/01_FURINA_CODE_INITIAL_LOOP_EDITION_TOTAL_DESIGN_V0.2_FROZEN.md": "e3fe7b0cc9fae0476f8a3cda929260a01f00705ff7ac13b42c8b3bfdb08435c0",
+    "40_TARGET_DESIGN/01_FURINA_CODE_MATURE_EDITION_TOTAL_DESIGN_V0.2_FROZEN.md": "ee4a302e3b2902be280086c0a960b1aac8874d1c3f17d9da837c93de1f341362",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -128,7 +135,7 @@ def verify_frozen_hashes(root: Path) -> list[str]:
     """Verify frozen files against expected hashes, independent of SHA256SUMS.txt."""
     errors = []
     if not FROZEN_EXPECTED_HASHES:
-        # First run: populate from current state
+        errors.append("FROZEN_EXPECTED_HASHES is empty — cannot verify frozen files")
         return errors
     for rel, expected in FROZEN_EXPECTED_HASHES.items():
         fp = root / rel
@@ -250,7 +257,8 @@ def generate_sha256sums() -> Path:
     return sha_path
 
 
-def generate_report(zip_sha256: str, test_results: dict[str, str] | None = None) -> Path:
+def generate_report(zip_sha256: str, test_results: dict[str, str] | None = None,
+                    evidence_revision: str | None = None) -> Path:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     active_files = collect_files(ACTIVE_DIR)
     frozen_files = [f for f in active_files if "_FROZEN" in f.name]
@@ -264,6 +272,10 @@ def generate_report(zip_sha256: str, test_results: dict[str, str] | None = None)
     # Test results: use real data if provided, otherwise mark unknown
     if test_results is None:
         test_results = {}
+
+    # Evidence revision: use provided value or mark unknown
+    if evidence_revision is None:
+        evidence_revision = "unknown (not provided to this script)"
 
     lines = [
         "---",
@@ -281,7 +293,7 @@ def generate_report(zip_sha256: str, test_results: dict[str, str] | None = None)
         "",
         "## Evidence Revision",
         "",
-        "`LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V2`",
+        f"`{evidence_revision}`",
         "",
         "## Repository State",
         "",
@@ -388,16 +400,33 @@ def run_anti_tamper_checks() -> list[str]:
             if sha256_file(extracted_test) == sha256_file(fake_active / "test.txt"):
                 errors.append("ANTI-TAMPER: Should detect content mismatch in ZIP")
 
-        # Test 3: Frozen file tamper detection
-        frozen_test = tmpdir_path / "frozen_test.md"
-        frozen_test.write_text("frozen content\n")
-        frozen_hash = sha256_file(frozen_test)
+        # Test 3: Frozen file tamper detection via verify_frozen_hashes
+        frozen_dir = tmpdir_path / "frozen_active"
+        frozen_dir.mkdir()
+        frozen_file = frozen_dir / "11_FORMAL_BASIS" / "01_TEST_FROZEN.md"
+        frozen_file.parent.mkdir(parents=True)
+        frozen_file.write_text("frozen content\n")
+        frozen_hash = sha256_file(frozen_file)
+
+        # Temporarily override FROZEN_EXPECTED_HASHES
+        original_hashes = FROZEN_EXPECTED_HASHES.copy()
+        FROZEN_EXPECTED_HASHES.clear()
+        FROZEN_EXPECTED_HASHES["11_FORMAL_BASIS/01_TEST_FROZEN.md"] = frozen_hash
+
+        # Verify should pass with original content
+        verify_errors = verify_frozen_hashes(frozen_dir)
+        if verify_errors:
+            errors.append(f"ANTI-TAMPER: Should pass with original frozen content: {verify_errors}")
 
         # Tamper the file
-        frozen_test.write_text("TAMPERED frozen content\n")
-        tampered_hash = sha256_file(frozen_test)
-        if frozen_hash == tampered_hash:
-            errors.append("ANTI-TAMPER: Should detect frozen file tamper")
+        frozen_file.write_text("TAMPERED frozen content\n")
+        tampered_errors = verify_frozen_hashes(frozen_dir)
+        if not tampered_errors:
+            errors.append("ANTI-TAMPER: Should detect frozen file tamper via verify_frozen_hashes")
+
+        # Restore original hashes
+        FROZEN_EXPECTED_HASHES.clear()
+        FROZEN_EXPECTED_HASHES.update(original_hashes)
 
     return errors
 
