@@ -114,20 +114,39 @@ def _get_git_status_short() -> str:
 
 
 def verify_sha256sums(root: Path) -> list[str]:
+    """Verify SHA256SUMS.txt with strict format and BOM tolerance."""
     errors = []
     sha_path = root / "SHA256SUMS.txt"
     if not sha_path.exists():
         return ["SHA256SUMS.txt not found"]
-    for line in sha_path.read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^([a-f0-9]{64})\s+(.+)$", line)
+    # Use utf-8-sig to silently strip BOM if present
+    raw = sha_path.read_text(encoding="utf-8-sig")
+    seen_files: set[str] = set()
+    for lineno, line in enumerate(raw.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = re.match(r"^([a-f0-9]{64})\s+(.+)$", stripped)
         if not m:
+            errors.append(f"FORMAT ERROR line {lineno}: {stripped!r}")
             continue
         expected, rel = m.group(1), m.group(2).strip()
+        if rel in seen_files:
+            errors.append(f"DUPLICATE ENTRY: {rel}")
+            continue
+        seen_files.add(rel)
         fp = root / rel
         if not fp.exists():
             errors.append(f"MISSING: {rel}")
         elif sha256_file(fp) != expected:
             errors.append(f"HASH MISMATCH: {rel}")
+    # Check for files in active that are not in SHA256SUMS.txt (except SHA256SUMS.txt itself)
+    for fp in collect_files(root):
+        rel = fp.relative_to(root).as_posix()
+        if rel == "SHA256SUMS.txt":
+            continue
+        if rel not in seen_files:
+            errors.append(f"NOT IN SHA256SUMS: {rel}")
     return errors
 
 
@@ -248,13 +267,32 @@ def verify_zip_vs_active(zip_path: Path) -> list[str]:
 
 
 def generate_sha256sums() -> Path:
+    """Generate SHA256SUMS.txt in BUILD_DIR from active directory."""
     sha_path = BUILD_DIR / "SHA256SUMS.txt"
     lines = []
     for fp in sorted(collect_files(ACTIVE_DIR)):
         rel = fp.relative_to(ACTIVE_DIR).as_posix()
+        if rel == "SHA256SUMS.txt":
+            continue
         lines.append(f"{sha256_file(fp)}  {rel}")
+    # Write without BOM
     sha_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return sha_path
+
+
+def regenerate_active_sha256sums() -> None:
+    """Regenerate active/SHA256SUMS.txt without BOM."""
+    sha_path = ACTIVE_DIR / "SHA256SUMS.txt"
+    lines = []
+    for fp in sorted(collect_files(ACTIVE_DIR)):
+        rel = fp.relative_to(ACTIVE_DIR).as_posix()
+        if rel == "SHA256SUMS.txt":
+            continue
+        lines.append(f"{sha256_file(fp)}  {rel}")
+    # Write without BOM using UTF8NoBOM
+    import codecs
+    with open(sha_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def generate_report(zip_sha256: str, test_results: dict[str, str] | None = None,
@@ -427,6 +465,32 @@ def run_anti_tamper_checks() -> list[str]:
         # Restore original hashes
         FROZEN_EXPECTED_HASHES.clear()
         FROZEN_EXPECTED_HASHES.update(original_hashes)
+
+        # Test 4: BOM in SHA256SUMS.txt
+        # Create a valid SHA256SUMS.txt, then inject BOM
+        bom_dir = tmpdir_path / "bom_active"
+        bom_dir.mkdir()
+        (bom_dir / "test.txt").write_text("content\n")
+        correct_hash = sha256_file(bom_dir / "test.txt")
+        # Write with BOM
+        bom_path = bom_dir / "SHA256SUMS.txt"
+        bom_bytes = b"\xef\xbb\xbf" + f"{correct_hash}  test.txt\n".encode("utf-8")
+        bom_path.write_bytes(bom_bytes)
+        # verify_sha256sums should handle BOM via utf-8-sig
+        bom_errors = verify_sha256sums(bom_dir)
+        if bom_errors:
+            errors.append(f"ANTI-TAMPER: BOM-tolerant SHA256SUMS verification should pass: {bom_errors}")
+
+        # Test 5: Invalid format line must be reported
+        bad_dir = tmpdir_path / "bad_active"
+        bad_dir.mkdir()
+        (bad_dir / "test.txt").write_text("content\n")
+        bad_path = bad_dir / "SHA256SUMS.txt"
+        bad_path.write_text("not_a_hash  test.txt\ninvalid_line_without_hash\n")
+        bad_errors = verify_sha256sums(bad_dir)
+        has_format_error = any("FORMAT ERROR" in e for e in bad_errors)
+        if not has_format_error:
+            errors.append("ANTI-TAMPER: Invalid SHA256SUMS format line should be reported")
 
     return errors
 
