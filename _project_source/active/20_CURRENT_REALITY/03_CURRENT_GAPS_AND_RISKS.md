@@ -2,7 +2,7 @@
 title: Furina Code 当前缺口与风险
 status: ACTIVE
 authority: REALITY
-version: 1.1
+version: 1.2
 prepared_at: 2026-07-17
 last_verified: 2026-07-17
 authority_scope: current_engineering_and_source_risks
@@ -25,7 +25,7 @@ implementation_authority: true
 
 ### R-003 受控写入范围仍极窄
 
-已建立 `notes/*.txt` 单文件创建的闭环；未覆盖更新、删除、重命名、多文件依赖、跨仓库、外部系统或高风险动作。不得将首个切片外推为“已可自主改代码”。
+已建立 `notes/*.txt` 单文件创建的闭环；未覆盖更新、删除、重命名、多文件依赖、跨仓库、外部系统或高风险动作。不得将首个切片外推为"已可自主改代码"。
 
 ### R-004 通用恢复裁决仍缺失
 
@@ -47,7 +47,7 @@ IL-L3 仅在隔离 Git 项目、低风险 `notes/*.txt` 单文件创建任务族
 
 ### R-008 历史来源携带过时现实
 
-旧 HEAD、旧测试数和“初循环未成立”的历史快照不得覆盖本包当前事实。
+旧 HEAD、旧测试数和"初循环未成立"的历史快照不得覆盖本包当前事实。
 
 ### R-009 依赖方向误读
 
@@ -57,7 +57,7 @@ IL-L3 仅在隔离 Git 项目、低风险 `notes/*.txt` 单文件创建任务族
 
 ### R-010 本地证据尚未形成新的提交/CI 锚点
 
-405 passed 是本地 Windows 证据窗口；在有新的提交 SHA 和 CI 前，不得宣称 GitHub main 或跨平台 CI 已验证本轮实现。
+437 passed 是本地 Windows 证据窗口；在有新的提交 SHA 和 CI 前，不得宣称 GitHub main 或跨平台 CI 已验证本轮实现。
 
 ### R-011 测试数量被当作能力等级
 

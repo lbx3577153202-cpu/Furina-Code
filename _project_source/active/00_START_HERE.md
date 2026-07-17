@@ -2,7 +2,7 @@
 title: Furina Code 项目来源入口
 status: ACTIVE
 authority: CONSTITUTION
-version: 1.3
+version: 1.4
 prepared_at: 2026-07-17
 last_verified: 2026-07-17
 authority_scope: source_navigation_and_current_project_orientation
@@ -25,23 +25,31 @@ implementation_authority: false
 
 ## 2. 当前真实状态摘要
 
-2026-07-17 的本地工程证据窗口：
+2026-07-17 的本地工程证据窗口（V1.4 修订）：
 
 ```text
 repository: lbx3577153202-cpu/Furina-Code
-verified_revision: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V1
-verification_environment: Windows 本地项目工作区
-pytest: 405 passed
-initial-loop suite: 17 passed
+head: 6c0d77965a6748449e386bcce2a30e5b36fac97c
+origin/main: 2a221ccd129507f0d32bccdacb3a8246a2c90b63
+branch: feat/initial-loop-e5-e7-source-maintenance
+verified_revision: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V2
+verification_environment: Windows 本地项目工作区（PR 工作分支）
+pytest: 437 passed
+initial-loop suite: 23 passed
+CI: unknown
 ```
 
-**第一版初循环已经成立，但仅限以下范围：**隔离 Git 项目内、低风险 `notes/*.txt` 单文件创建任务族的两轮受控写入与第二轮经验试用。
+**初循环在严格限定范围内成立：**隔离 Git 项目内、低风险 `notes/*.txt` 单文件创建任务族的两轮受控写入与第二轮经验试用。
 
 ```text
-观察 → 计划 → 授权 → 写入 → 对账 → 验证 → 裁决 → 终态 → 第二轮经验试用
+观察 → 计划(含经验匹配引用) → 授权 → 执行前重新观察现实 → 写入 → 对账 → 验证 → 裁决 → 终态
 ```
 
-其中未知写入结果绝不自动重试；第二轮经验只作候选指导，成功后最高为 `conditional`，不会直接成为可复用授权。正式证据与边界见 `20_CURRENT_REALITY/05_INITIAL_LOOP_ESTABLISHMENT_RECORD.md`。
+V1.4 修订：
+- 执行前重新观察现实（act-time snapshot），确保执行器面对真实项目状态；
+- E7 经验因果链通过 `experience_match_ref` 和 `action_plan_ref` 正式绑定；
+- 冻结稿独立防篡改校验（不依赖可编辑的 SHA256SUMS.txt）；
+- ZIP 逐文件内容校验和真实发布元数据。
 
 仍不能声称：广义 Furina Code 已完成、MiMo Code 已加载本地生命系统、产品级入口已开放、任意项目写入安全可用、通用恢复/长期经验已完成，或用户可长期托付成熟开发责任。
 

@@ -2,12 +2,12 @@
 title: Furina Code 当前工程证据索引
 status: SNAPSHOT
 authority: REALITY
-version: 1.1
+version: 1.2
 prepared_at: 2026-07-17
 last_verified: 2026-07-17
 authority_scope: engineering_evidence_index
 implementation_authority: false
-snapshot_head: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V1
+snapshot_head: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V2
 ---
 
 # Furina Code 当前工程证据索引
@@ -16,22 +16,24 @@ snapshot_head: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V1
 
 | 证据窗口 | 结果 | 主要内容 | 真实性边界 |
 |---|---|---|---|
-| 历史 E2–E4 / MC1 | 已有 | Python 基线、生命脊柱、只读真实闭环、BackendPort/FileBackend | 不等于写入、恢复或经验成长 |
-| 历史 main 清理锚点 | `2a221ccd…` | MiMo 专属 Adapter 已从 main 删除 | 是初循环前锚点，不能代表本轮代码 |
-| 本地 E5 | passed | 计划绑定、授权票据、动作收据、写后对账、验证和完成链 | 仅单文件创建任务族 |
+| 历史 E2-E4 / MC1 | 已有 | Python 基线、生命脊柱、只读真实闭环、BackendPort/FileBackend | 不等于写入、恢复或经验成长 |
+| 历史 main 清理锚点 | `2a221ccd...` | MiMo 专属 Adapter 已从 main 删除 | 是初循环前锚点，不能代表本轮代码 |
+| 本地 E5 | passed | 计划绑定、授权票据、动作收据、act-time snapshot、写后对账、验证和完成链 | 仅单文件创建任务族 |
 | 本地 E6 | passed | 中断恢复、未知结果观察、暂停、因果绑定 | 仅单文件写入副作用 |
-| 本地 E7 | passed | 候选经验、第二轮试用、升降级 | 最高 `conditional`，不代表可复用经验 |
+| 本地 E7 | passed | 候选经验、experience_match_ref/action_plan_ref 正式绑定、第二轮试用、升降级 | 最高 `conditional`，不代表可复用经验 |
 | 本地初循环端到端 | passed | 两轮不同 `notes/*.txt` 真实写入与经验试用 | 隔离 Git 项目、低风险单文件 |
-| Windows 本地全量 pytest | **405 passed** | 回归验证窗口 | 未提交 main、未形成新 CI run |
+| Windows 本地全量 pytest | **437 passed** | 回归验证窗口 | 未提交 main、未形成新 CI run |
 
 ## 当前锚点
 
 ```text
-evidence_revision: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V1
-main_head_for_this_change: 未记录（不得用旧 2a221ccd… 代替）
-targeted_initial_loop_tests: 17 passed
-full_local_tests: 405 passed
-ci_for_this_change: 未记录
+evidence_revision: LOCAL_WORKING_TREE_AFTER_INITIAL_LOOP_V2
+head: 6c0d77965a6748449e386bcce2a30e5b36fac97c
+origin/main: 2a221ccd129507f0d32bccdacb3a8246a2c90b63
+branch: feat/initial-loop-e5-e7-source-maintenance
+targeted_initial_loop_tests: 23 passed
+full_local_tests: 437 passed
+ci_for_this_change: unknown
 ```
 
 ## 使用规则

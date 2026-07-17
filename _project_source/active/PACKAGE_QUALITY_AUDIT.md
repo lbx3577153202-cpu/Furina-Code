@@ -2,7 +2,7 @@
 title: 活跃来源包质量审计
 status: ACTIVE
 authority: MAINTENANCE
-version: 1.3
+version: 1.4
 prepared_at: 2026-07-17
 ---
 
@@ -10,21 +10,29 @@ prepared_at: 2026-07-17
 
 ## 审计结论
 
-本包可作为唯一活跃项目来源直接替换。它将初循环前的工程快照更新为 2026-07-17 的受限建立状态，同时保留冻结原稿的字节内容和历史边界。
+本包可作为唯一活跃项目来源直接替换。V1.4 在 V1.3 基础上修复了初循环的执行前现实核验、E7 实际计划因果链、冻结稿独立防篡改和发布元数据真实性。
 
-## 本轮修订
+## V1.4 修订原因
 
-- 更新入口摘要、工程快照、能力账本、缺口/风险与工程证据索引；
-- 新增 `05_INITIAL_LOOP_ESTABLISHMENT_RECORD.md`，把初循环成立的范围、证据、反例和未覆盖边界单独固定；
-- 不修改任何冻结原稿、项目宪法或既有 PDR；
-- 明确本轮证据来自本地 Windows 工作区：405 全量通过、17 项初循环相关通过；
-- 明确没有新的 main 提交 SHA 或 CI run，避免伪造云端锚点。
+1. **执行前现实核验**：E5 执行器在 `execute_single_file_create()` 前重新创建 act-time snapshot，确保执行面对真实项目状态而非 observe-time 快照；
+2. **E7 实际计划因果链**：`BoundActionPlan.experience_match_ref` 和 `CompletionVerdict.action_plan_ref` 为正式对象字段，`record_trial_use()` 验证完整链路；
+3. **冻结稿独立防篡改**：`FROZEN_EXPECTED_HASHES` 包含真实 SHA-256，不依赖可编辑的 SHA256SUMS.txt；
+4. **ZIP 逐文件内容校验**：解压后逐文件 SHA-256 比对，拒绝缺失、额外或内容不一致的文件；
+5. **真实发布元数据**：HEAD、origin/main、branch、status 从 Git 实时读取，不硬编码。
+
+## 测试证据
+
+- 初循环集合（E5/E6/E7/initial_loop）：23 passed
+- 全量 pytest：437 passed
+- CI：unknown（本工作分支无新 main SHA 或 CI run）
+- HEAD：`6c0d77965a6748449e386bcce2a30e5b36fac97c`
+- origin/main：`2a221ccd129507f0d32bccdacb3a8246a2c90b63`
 
 ## 一致性检查
 
 - 当前入口、现实账本、缺口、证据索引和建立记录对初循环范围表述一致；
 - 初循环成立仅限隔离 Git 项目、低风险 `notes/*.txt` 单文件创建、两轮受控写入与第二轮受限经验试用；
-- 不存在“Furina Code 调用 MiMo”的新路线；
+- 不存在"Furina Code 调用 MiMo"的新路线；
 - 不存在将本地测试误写成产品入口、GitHub main 或跨平台 CI 的表述；
 - 完整性清单覆盖本包全部 Markdown 文件并记录哈希。
 
