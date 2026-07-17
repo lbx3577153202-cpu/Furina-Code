@@ -13,10 +13,14 @@ from furina_code.experience import (
 from furina_code.ledger import Ledger
 
 
-def _completion(task_id: str, outcome: str = "completed") -> CompletionVerdict:
+def _completion(task_id: str, outcome: str = "completed", *,
+                task_run_id: str | None = None, correlation_id: str | None = None,
+                project: str = "project-1", task_revision: int = 1) -> CompletionVerdict:
+    run_id = task_run_id or f"run-{task_id}"
+    corr_id = correlation_id or f"corr-{task_id}"
     return CompletionVerdict.create(
-        run_binding_id=f"rb-{task_id}", task_id=task_id, task_run_id=f"run-{task_id}",
-        project_ref="project-1", correlation_id=f"corr-{task_id}", task_revision=1,
+        run_binding_id=f"rb-{task_id}", task_id=task_id, task_run_id=run_id,
+        project_ref=project, correlation_id=corr_id, task_revision=task_revision,
         task_run_ref="sha256:task-run", verification_ref="sha256:verification",
         candidate_ref="candidate:controlled-write", outcome=outcome,
         completed_items=("controlled write",) if outcome == "completed" else (),
@@ -38,7 +42,7 @@ def test_independent_second_task_turns_candidate_into_conditional_experience(tmp
         target_scope=("notes/",), risk="low",
     )
     write_experience_object(ledger, match, 0)
-    second = _completion("task-two")
+    second = _completion("task-two", task_run_id="run-two", correlation_id="corr-two")
     trial = record_trial_use(experience, match, second)
     write_experience_object(ledger, trial, 0)
     lifecycle = adjudicate_trial(experience, trial)
@@ -71,7 +75,8 @@ def test_failed_second_task_degrades_instead_of_promoting_experience():
         project_ref="project-1", correlation_id="corr-two", task_revision=1,
         target_scope=("notes/",), risk="low",
     )
-    trial = record_trial_use(experience, match, _completion("task-two", "not_completed"))
+    trial = record_trial_use(experience, match, _completion("task-two", "not_completed",
+                                                           task_run_id="run-two", correlation_id="corr-two"))
 
     assert adjudicate_trial(experience, trial).new_status == "degraded"
 

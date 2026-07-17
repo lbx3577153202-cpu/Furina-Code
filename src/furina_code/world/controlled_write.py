@@ -206,6 +206,7 @@ def bind_single_file_create(
     content: str,
     *,
     target_path: str = E5_TARGET_PATH,
+    experience_match_ref: str | None = None,
 ) -> BoundActionPlan:
     """Bind the sole E5 operation to one observed project state."""
     if not snapshot.is_clean:
@@ -214,6 +215,9 @@ def bind_single_file_create(
         raise ContractInvalid("E5 content must not be empty")
     if not _allowed_target_path(target_path):
         raise ContractInvalid("E5 target must be one .txt file directly within notes/")
+    preconditions = ["baseline_clean", "target_absent"]
+    if experience_match_ref:
+        preconditions.append(f"experience_match:{experience_match_ref}")
     return BoundActionPlan.create(
         run_binding_id=snapshot.meta.run_binding_id,
         task_id=snapshot.meta.task_id,
@@ -229,7 +233,7 @@ def bind_single_file_create(
         expected_diff={"created_path": target_path, "content_sha256": _content_sha256(content)},
         risk="low",
         rollback_or_compensation="remove only the created target after a new authorization",
-        preconditions=("baseline_clean", "target_absent"),
+        preconditions=tuple(preconditions),
         causation_ref=snapshot.meta.integrity_ref,
     )
 

@@ -122,6 +122,21 @@ def record_trial_use(
         raise ContractInvalid("Trial use requires a matching conditional recommendation")
     if completion.meta.task_id == experience.meta.task_id:
         raise ContractInvalid("Trial use must be a second task, not the source task")
+    # Causal chain validation: match, completion, and experience must share
+    # the same second-round task identity (task, run, project, correlation).
+    if match.meta.task_id != completion.meta.task_id:
+        raise ContractInvalid("Match and completion must belong to the same second-round task")
+    if match.meta.task_run_id != completion.meta.task_run_id:
+        raise ContractInvalid("Match and completion must belong to the same second-round task run")
+    if match.meta.project_ref != completion.meta.project_ref:
+        raise ContractInvalid("Match and completion must belong to the same project")
+    if match.meta.correlation_id != completion.meta.correlation_id:
+        raise ContractInvalid("Match and completion must share the same correlation")
+    if match.task_revision != completion.task_revision:
+        raise ContractInvalid("Match and completion must reference the same task revision")
+    # Verify the experience ref is consistent between match and experience
+    if experience.meta.integrity_ref not in match.candidate_refs:
+        raise ContractInvalid("Experience ref in match must match the experience being trialed")
     result = "completed" if completion.outcome == "completed" else "not_completed"
     return TrialUseRecord.create(
         run_binding_id=completion.meta.run_binding_id, task_id=completion.meta.task_id,

@@ -62,6 +62,7 @@ def run_controlled_write_cycle(
     user_authority_refs: tuple[str, ...],
     content: str,
     target_path: str,
+    experience_match_ref: str | None = None,
 ) -> ControlledWriteCycle:
     """Execute one low-risk file creation through observe→terminal.
 
@@ -77,7 +78,8 @@ def run_controlled_write_cycle(
     )
     write_e5_object(ledger, before, 0)
     run = _advance(ledger, run, Phase.DELIBERATE, (before.meta.integrity_ref,))
-    plan = bind_single_file_create(before, candidate_ref, content, target_path=target_path)
+    plan = bind_single_file_create(before, candidate_ref, content, target_path=target_path,
+                                   experience_match_ref=experience_match_ref)
     write_e5_object(ledger, plan, 0)
     run = _advance(ledger, run, Phase.AUTHORIZE, (plan.meta.integrity_ref,))
     decision = evaluate_single_file_authorization(plan, "user", user_authority_refs)
@@ -85,8 +87,16 @@ def run_controlled_write_cycle(
     ticket = issue_single_file_ticket(decision, plan)
     write_e5_object(ledger, ticket, 0)
     run = _advance(ledger, run, Phase.ACT, (ticket.meta.integrity_ref,))
+    # Fresh reality snapshot immediately before execution: the executor must
+    # enforce against the *current* project state, not the observe-time baseline.
+    act_time = create_project_snapshot(
+        run_binding_id, task_id, task_run_id, project_ref, correlation_id, workspace,
+        snapshot_id=f"{task_id}:snapshot:act-time",
+        causation_ref=ticket.meta.integrity_ref,
+    )
+    write_e5_object(ledger, act_time, 0)
     execution = execute_single_file_create(
-        ledger, workspace, plan, ticket, before, f"{task_id}:create:{target_path}", run,
+        ledger, workspace, plan, ticket, act_time, f"{task_id}:create:{target_path}", run,
     )
     if execution.receipt is None:
         raise RuntimeError(f"Controlled write was denied: {execution.enforcement.reason}")
