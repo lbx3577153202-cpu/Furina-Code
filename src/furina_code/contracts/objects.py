@@ -31,6 +31,7 @@ OWNER_MAP: dict[str, str] = {
     "TaskDossier": "I2-A",
     "TaskRun": "I2-D",
     "Checkpoint": "I1-C",
+    "RecoveryVerdict": "I1-C",
     # E4
     "BackendProfile": "I2-B",
     "ContextEnvelope": "I2-C",
@@ -40,6 +41,18 @@ OWNER_MAP: dict[str, str] = {
     "VerificationPlan": "I4-D",
     "VerificationVerdict": "I4-D",
     "CompletionVerdict": "I4-E",
+    # E5
+    "BoundActionPlan": "I3-B",
+    "ActionReceipt": "I3-C",
+    "RealityReconciliation": "I3-D",
+    "AuthorizationDecision": "I4-A",
+    "AuthorizationTicket": "I4-B",
+    "EnforcementVerdict": "I4-B",
+    # E7
+    "ExperienceCandidate": "I5-A",
+    "ExperienceMatch": "I5-B",
+    "TrialUseRecord": "I5-B",
+    "ExperienceLifecycleVerdict": "I5-C",
 }
 
 
@@ -120,6 +133,40 @@ def _check_object_type(obj: Any, expected_type: str) -> None:
         raise ContractInvalid(f"meta.object_type must be {expected_type}")
     if obj.meta.owner_organ != OWNER_MAP[expected_type]:
         raise AuthorityViolation(f"{expected_type} owner_organ mismatch")
+
+
+def _revise_meta(meta: CanonicalMeta, payload: dict[str, Any]) -> CanonicalMeta:
+    """Build the next immutable revision for a formal object."""
+    now = now_utc()
+    revision = meta.revision + 1
+    supersedes_ref = f"{meta.object_type}:{meta.object_id}:rev{meta.revision}"
+    fields = {
+        "schema_version": SCHEMA_VERSION,
+        "object_type": meta.object_type,
+        "object_id": meta.object_id,
+        "revision": revision,
+        "owner_organ": meta.owner_organ,
+        "run_binding_id": meta.run_binding_id,
+        "task_id": meta.task_id,
+        "task_run_id": meta.task_run_id,
+        "project_ref": meta.project_ref,
+        "correlation_id": meta.correlation_id,
+        "causation_ref": supersedes_ref,
+        "created_at": now.isoformat(),
+        "recorded_at": now.isoformat(),
+        "classification": meta.classification,
+        "supersedes_ref": supersedes_ref,
+    }
+    return CanonicalMeta(
+        schema_version=SCHEMA_VERSION, object_type=meta.object_type,
+        object_id=meta.object_id, revision=revision, owner_organ=meta.owner_organ,
+        run_binding_id=meta.run_binding_id, task_id=meta.task_id,
+        task_run_id=meta.task_run_id, project_ref=meta.project_ref,
+        correlation_id=meta.correlation_id, causation_ref=supersedes_ref,
+        created_at=now, recorded_at=now, classification=meta.classification,
+        integrity_ref=compute_integrity_ref(fields, payload),
+        supersedes_ref=supersedes_ref,
+    )
 
 
 # --- RunBinding ---
@@ -231,6 +278,36 @@ class TaskDossier:
             status=TaskDossierStatus.ACTIVE,
         )
 
+    def revise(
+        self,
+        *,
+        structured_goal: str,
+        success_criteria: tuple[str, ...],
+        scope: tuple[str, ...],
+        exclusions: tuple[str, ...],
+        unknowns: tuple[str, ...],
+        risk_class: str,
+        user_constraints: tuple[str, ...],
+        source_intent_ref: str | None = None,
+    ) -> TaskDossier:
+        """Preserve the prior intent record while making a user correction explicit."""
+        payload = {
+            "source_intent_ref": source_intent_ref or self.source_intent_ref,
+            "structured_goal": structured_goal,
+            "success_criteria": list(success_criteria), "scope": list(scope),
+            "exclusions": list(exclusions), "unknowns": list(unknowns),
+            "risk_class": risk_class, "user_constraints": list(user_constraints),
+            "status": TaskDossierStatus.ACTIVE.value,
+        }
+        return TaskDossier(
+            meta=_revise_meta(self.meta, payload),
+            source_intent_ref=source_intent_ref or self.source_intent_ref,
+            structured_goal=structured_goal, success_criteria=success_criteria,
+            scope=scope, exclusions=exclusions, unknowns=unknowns,
+            risk_class=risk_class, user_constraints=user_constraints,
+            status=TaskDossierStatus.ACTIVE,
+        )
+
 
 # --- TaskRun ---
 
@@ -309,11 +386,22 @@ class TaskRun:
                 },
             )
 
+        if self.disposition == Disposition.RECOVERY_REVIEW and not recovery_verdict_ref:
+            raise StateTransitionInvalid(
+                "Leaving recovery_review requires a RecoveryVerdict reference",
+                {"current_phase": self.phase.value, "new_phase": new_phase.value},
+            )
+
         now = now_utc()
         new_rev = self.meta.revision + 1
         corr = correlation_id or self.meta.correlation_id
         supersedes_ref = f"TaskRun:{self.meta.object_id}:rev{self.meta.revision}"
         resolved_refs = self.current_refs if current_refs is None else current_refs
+        # Recovery is a causal decision, not merely a parameter used to open a
+        # state-machine edge.  Preserve it in the new TaskRun revision so a
+        # rebuilt continuity view can explain why execution resumed.
+        if recovery_verdict_ref and recovery_verdict_ref not in resolved_refs:
+            resolved_refs = (*resolved_refs, recovery_verdict_ref)
         resolved_requests = self.open_requests if open_requests is None else open_requests
         resolved_reason = self.terminal_reason if terminal_reason is None else terminal_reason
 
@@ -337,7 +425,7 @@ class TaskRun:
             "task_run_id": self.meta.task_run_id,
             "project_ref": self.meta.project_ref,
             "correlation_id": corr,
-            "causation_ref": supersedes_ref,
+            "causation_ref": recovery_verdict_ref or supersedes_ref,
             "created_at": now.isoformat(),
             "recorded_at": now.isoformat(),
             "classification": "project_internal",
@@ -355,7 +443,7 @@ class TaskRun:
             task_run_id=self.meta.task_run_id,
             project_ref=self.meta.project_ref,
             correlation_id=corr,
-            causation_ref=supersedes_ref,
+            causation_ref=recovery_verdict_ref or supersedes_ref,
             created_at=now,
             recorded_at=now,
             classification="project_internal",
@@ -387,10 +475,6 @@ class Checkpoint:
 
     def __post_init__(self) -> None:
         _check_object_type(self, "Checkpoint")
-        if self.pending_actions:
-            raise ContractInvalid("Checkpoint.pending_actions must be empty")
-        if self.ticket_refs:
-            raise ContractInvalid("Checkpoint.ticket_refs must be empty")
 
     @staticmethod
     def create(
@@ -406,6 +490,8 @@ class Checkpoint:
         pending_requests: tuple[str, ...],
         snapshot_ref: str | None,
         reason: str,
+        pending_actions: tuple[str, ...] = (),
+        ticket_refs: tuple[str, ...] = (),
         causation_ref: str | None = None,
     ) -> Checkpoint:
         now = now_utc()
@@ -415,9 +501,9 @@ class Checkpoint:
             "disposition": disposition.value,
             "event_cursor": event_cursor,
             "pending_requests": list(pending_requests),
-            "pending_actions": [],
+            "pending_actions": list(pending_actions),
             "snapshot_ref": snapshot_ref,
-            "ticket_refs": [],
+            "ticket_refs": list(ticket_refs),
             "reason": reason,
         }
         object_id = f"{task_id}:checkpoint:{task_revision}"
@@ -430,9 +516,59 @@ class Checkpoint:
             meta=meta, task_revision=task_revision,
             phase=phase, disposition=disposition,
             event_cursor=event_cursor, pending_requests=pending_requests,
-            pending_actions=(), snapshot_ref=snapshot_ref,
-            ticket_refs=(), reason=reason,
+            pending_actions=pending_actions, snapshot_ref=snapshot_ref,
+            ticket_refs=ticket_refs, reason=reason,
         )
+
+
+# --- E6 recovery ---
+
+_RECOVERY_OUTCOMES = frozenset({
+    "continue_no_replay", "skip_confirmed_action", "retry_confirmed_not_applied",
+    "compensate", "pause", "manual_intervention", "cancel",
+})
+
+
+@dataclass(frozen=True)
+class RecoveryVerdict:
+    meta: CanonicalMeta
+    checkpoint_ref: str
+    fresh_snapshot_refs: tuple[str, ...]
+    receipt_refs: tuple[str, ...]
+    ticket_review: str
+    outcome: str
+    resume_phase: Phase | None
+    required_steps: tuple[str, ...]
+    reason: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "RecoveryVerdict")
+        if self.outcome not in _RECOVERY_OUTCOMES:
+            raise ContractInvalid(f"Invalid RecoveryVerdict outcome: {self.outcome}")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, checkpoint_ref: str, fresh_snapshot_refs: tuple[str, ...],
+        receipt_refs: tuple[str, ...], ticket_review: str, outcome: str,
+        resume_phase: Phase | None, required_steps: tuple[str, ...], reason: str,
+        verdict_id: str | None = None, causation_ref: str | None = None,
+    ) -> RecoveryVerdict:
+        payload = {
+            "checkpoint_ref": checkpoint_ref,
+            "fresh_snapshot_refs": list(fresh_snapshot_refs),
+            "receipt_refs": list(receipt_refs), "ticket_review": ticket_review,
+            "outcome": outcome,
+            "resume_phase": resume_phase.value if resume_phase else None,
+            "required_steps": list(required_steps), "reason": reason,
+        }
+        oid = verdict_id or f"{task_id}:recovery-verdict:1"
+        meta, _ = _build_meta_and_integrity(
+            "RecoveryVerdict", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return RecoveryVerdict(meta, checkpoint_ref, fresh_snapshot_refs, receipt_refs,
+                               ticket_review, outcome, resume_phase, required_steps, reason)
 
 
 # --- E4 Objects ---
@@ -759,6 +895,307 @@ class ProjectSnapshot:
         )
 
 
+# --- E5 controlled-write objects ---
+
+_TICKET_STATUSES = frozenset({"active", "consumed", "revoked", "expired", "invalidated"})
+_RECEIPT_STATUSES = frozenset({"executing", "applied", "not_applied", "outcome_unknown"})
+_RECONCILIATION_VERDICTS = frozenset({"expected", "divergent", "unknown"})
+
+
+@dataclass(frozen=True)
+class BoundActionPlan:
+    meta: CanonicalMeta
+    candidate_ref: str
+    task_revision: int
+    baseline_snapshot_ref: str
+    baseline_snapshot_sha256: str
+    target_scope: tuple[str, ...]
+    operations: tuple[dict[str, Any], ...]
+    expected_diff: dict[str, Any]
+    risk: str
+    rollback_or_compensation: str
+    preconditions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "BoundActionPlan")
+        if not self.operations:
+            raise ContractInvalid("BoundActionPlan.operations must not be empty")
+        if not self.target_scope:
+            raise ContractInvalid("BoundActionPlan.target_scope must not be empty")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, candidate_ref: str, task_revision: int,
+        baseline_snapshot_ref: str, baseline_snapshot_sha256: str,
+        target_scope: tuple[str, ...], operations: tuple[dict[str, Any], ...],
+        expected_diff: dict[str, Any], risk: str,
+        rollback_or_compensation: str, preconditions: tuple[str, ...],
+        plan_id: str | None = None, causation_ref: str | None = None,
+    ) -> BoundActionPlan:
+        payload = {
+            "candidate_ref": candidate_ref, "task_revision": task_revision,
+            "baseline_snapshot_ref": baseline_snapshot_ref,
+            "baseline_snapshot_sha256": baseline_snapshot_sha256,
+            "target_scope": list(target_scope), "operations": list(operations),
+            "expected_diff": expected_diff, "risk": risk,
+            "rollback_or_compensation": rollback_or_compensation,
+            "preconditions": list(preconditions),
+        }
+        oid = plan_id or f"{task_id}:action-plan:1"
+        meta, _ = _build_meta_and_integrity(
+            "BoundActionPlan", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return BoundActionPlan(meta, candidate_ref, task_revision, baseline_snapshot_ref,
+                               baseline_snapshot_sha256, target_scope, operations,
+                               expected_diff, risk, rollback_or_compensation, preconditions)
+
+
+@dataclass(frozen=True)
+class AuthorizationDecision:
+    meta: CanonicalMeta
+    subject_ref: str
+    task_revision: int
+    plan_ref: str
+    snapshot_ref: str
+    policy_version: str
+    decision: str
+    conditions: tuple[str, ...]
+    reason: str
+    user_authority_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "AuthorizationDecision")
+        if self.decision not in {"allow", "deny"}:
+            raise ContractInvalid("AuthorizationDecision.decision must be allow or deny")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, subject_ref: str, task_revision: int, plan_ref: str,
+        snapshot_ref: str, policy_version: str, decision: str,
+        conditions: tuple[str, ...], reason: str,
+        user_authority_refs: tuple[str, ...], decision_id: str | None = None,
+        causation_ref: str | None = None,
+    ) -> AuthorizationDecision:
+        payload = {
+            "subject_ref": subject_ref, "task_revision": task_revision,
+            "plan_ref": plan_ref, "snapshot_ref": snapshot_ref,
+            "policy_version": policy_version, "decision": decision,
+            "conditions": list(conditions), "reason": reason,
+            "user_authority_refs": list(user_authority_refs),
+        }
+        oid = decision_id or f"{task_id}:authorization-decision:1"
+        meta, _ = _build_meta_and_integrity(
+            "AuthorizationDecision", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return AuthorizationDecision(meta, subject_ref, task_revision, plan_ref, snapshot_ref,
+                                     policy_version, decision, conditions, reason,
+                                     user_authority_refs)
+
+
+@dataclass(frozen=True)
+class AuthorizationTicket:
+    meta: CanonicalMeta
+    decision_ref: str
+    plan_ref: str
+    task_revision: int
+    snapshot_ref: str
+    scope: tuple[str, ...]
+    valid_from: datetime
+    expires_at: datetime
+    single_use: bool
+    status: str
+    revocation_ref: str | None
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "AuthorizationTicket")
+        if self.status not in _TICKET_STATUSES:
+            raise ContractInvalid(f"Invalid AuthorizationTicket status: {self.status}")
+        if not self.single_use:
+            raise ContractInvalid("E5 AuthorizationTicket must be single_use")
+        if self.expires_at <= self.valid_from:
+            raise ContractInvalid("AuthorizationTicket expires_at must be after valid_from")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, decision_ref: str, plan_ref: str, task_revision: int,
+        snapshot_ref: str, scope: tuple[str, ...], valid_from: datetime,
+        expires_at: datetime, ticket_id: str | None = None,
+        causation_ref: str | None = None,
+    ) -> AuthorizationTicket:
+        payload = {
+            "decision_ref": decision_ref, "plan_ref": plan_ref,
+            "task_revision": task_revision, "snapshot_ref": snapshot_ref,
+            "scope": list(scope), "valid_from": valid_from.isoformat(),
+            "expires_at": expires_at.isoformat(), "single_use": True,
+            "status": "active", "revocation_ref": None,
+        }
+        oid = ticket_id or f"{task_id}:authorization-ticket:1"
+        meta, _ = _build_meta_and_integrity(
+            "AuthorizationTicket", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return AuthorizationTicket(meta, decision_ref, plan_ref, task_revision, snapshot_ref,
+                                   scope, valid_from, expires_at, True, "active", None)
+
+    def consume(self) -> AuthorizationTicket:
+        if self.status != "active":
+            raise ContractInvalid("Only an active AuthorizationTicket may be consumed")
+        payload = {
+            "decision_ref": self.decision_ref, "plan_ref": self.plan_ref,
+            "task_revision": self.task_revision, "snapshot_ref": self.snapshot_ref,
+            "scope": list(self.scope), "valid_from": self.valid_from.isoformat(),
+            "expires_at": self.expires_at.isoformat(), "single_use": self.single_use,
+            "status": "consumed", "revocation_ref": self.revocation_ref,
+        }
+        return AuthorizationTicket(_revise_meta(self.meta, payload), self.decision_ref,
+                                   self.plan_ref, self.task_revision, self.snapshot_ref,
+                                   self.scope, self.valid_from, self.expires_at, self.single_use,
+                                   "consumed", self.revocation_ref)
+
+
+@dataclass(frozen=True)
+class EnforcementVerdict:
+    meta: CanonicalMeta
+    ticket_ref: str
+    plan_ref: str
+    current_snapshot_ref: str
+    decision: str
+    checked_at: datetime
+    reason: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "EnforcementVerdict")
+        if self.decision not in {"allow", "deny"}:
+            raise ContractInvalid("EnforcementVerdict.decision must be allow or deny")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, ticket_ref: str, plan_ref: str,
+        current_snapshot_ref: str, decision: str, reason: str,
+        verdict_id: str | None = None, causation_ref: str | None = None,
+    ) -> EnforcementVerdict:
+        now = now_utc()
+        payload = {"ticket_ref": ticket_ref, "plan_ref": plan_ref,
+                   "current_snapshot_ref": current_snapshot_ref,
+                   "decision": decision, "checked_at": now.isoformat(), "reason": reason}
+        oid = verdict_id or f"{task_id}:enforcement:1"
+        meta, _ = _build_meta_and_integrity(
+            "EnforcementVerdict", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return EnforcementVerdict(meta, ticket_ref, plan_ref, current_snapshot_ref,
+                                  decision, now, reason)
+
+
+@dataclass(frozen=True)
+class ActionReceipt:
+    meta: CanonicalMeta
+    plan_ref: str
+    ticket_ref: str
+    idempotency_key: str
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    tool_ref: str
+    raw_result_ref: str | None
+    exit_info: dict[str, Any]
+    side_effect_assessment: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "ActionReceipt")
+        if self.status not in _RECEIPT_STATUSES:
+            raise ContractInvalid(f"Invalid ActionReceipt status: {self.status}")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, plan_ref: str, ticket_ref: str, idempotency_key: str,
+        tool_ref: str, receipt_id: str | None = None,
+        causation_ref: str | None = None,
+    ) -> ActionReceipt:
+        now = now_utc()
+        payload = {"plan_ref": plan_ref, "ticket_ref": ticket_ref,
+                   "idempotency_key": idempotency_key, "status": "executing",
+                   "started_at": now.isoformat(), "ended_at": None,
+                   "tool_ref": tool_ref, "raw_result_ref": None,
+                   "exit_info": {}, "side_effect_assessment": "execution_started"}
+        oid = receipt_id or f"{task_id}:action-receipt:1"
+        meta, _ = _build_meta_and_integrity(
+            "ActionReceipt", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return ActionReceipt(meta, plan_ref, ticket_ref, idempotency_key, "executing",
+                             now, None, tool_ref, None, {}, "execution_started")
+
+    def finish(self, status: str, raw_result_ref: str | None,
+               exit_info: dict[str, Any], side_effect_assessment: str) -> ActionReceipt:
+        if self.status != "executing":
+            raise ContractInvalid("Only an executing ActionReceipt may be finished")
+        if status not in _RECEIPT_STATUSES - {"executing"}:
+            raise ContractInvalid(f"Invalid terminal ActionReceipt status: {status}")
+        now = now_utc()
+        payload = {
+            "plan_ref": self.plan_ref, "ticket_ref": self.ticket_ref,
+            "idempotency_key": self.idempotency_key, "status": status,
+            "started_at": self.started_at.isoformat(), "ended_at": now.isoformat(),
+            "tool_ref": self.tool_ref, "raw_result_ref": raw_result_ref,
+            "exit_info": exit_info, "side_effect_assessment": side_effect_assessment,
+        }
+        return ActionReceipt(_revise_meta(self.meta, payload), self.plan_ref, self.ticket_ref,
+                             self.idempotency_key, status, self.started_at, now, self.tool_ref,
+                             raw_result_ref, exit_info, side_effect_assessment)
+
+
+@dataclass(frozen=True)
+class RealityReconciliation:
+    meta: CanonicalMeta
+    plan_ref: str
+    receipt_ref: str
+    before_snapshot_ref: str
+    after_snapshot_ref: str
+    expected_diff: dict[str, Any]
+    actual_diff: dict[str, Any]
+    unexpected_changes: tuple[str, ...]
+    verdict: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "RealityReconciliation")
+        if self.verdict not in _RECONCILIATION_VERDICTS:
+            raise ContractInvalid(f"Invalid RealityReconciliation verdict: {self.verdict}")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, plan_ref: str, receipt_ref: str,
+        before_snapshot_ref: str, after_snapshot_ref: str,
+        expected_diff: dict[str, Any], actual_diff: dict[str, Any],
+        unexpected_changes: tuple[str, ...], verdict: str,
+        reconciliation_id: str | None = None,
+        causation_ref: str | None = None,
+    ) -> RealityReconciliation:
+        payload = {
+            "plan_ref": plan_ref, "receipt_ref": receipt_ref,
+            "before_snapshot_ref": before_snapshot_ref,
+            "after_snapshot_ref": after_snapshot_ref,
+            "expected_diff": expected_diff, "actual_diff": actual_diff,
+            "unexpected_changes": list(unexpected_changes), "verdict": verdict,
+        }
+        oid = reconciliation_id or f"{task_id}:reconciliation:1"
+        meta, _ = _build_meta_and_integrity(
+            "RealityReconciliation", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return RealityReconciliation(meta, plan_ref, receipt_ref, before_snapshot_ref,
+                                     after_snapshot_ref, expected_diff, actual_diff,
+                                     unexpected_changes, verdict)
+
+
 @dataclass(frozen=True)
 class EvidenceEnvelope:
     meta: CanonicalMeta
@@ -960,6 +1397,24 @@ class VerificationVerdict:
             checked_at=now,
         )
 
+    def invalidate_for_reality_change(self, reason: str) -> VerificationVerdict:
+        """A changed project creates a new non-passing verdict; old evidence stays intact."""
+        checked_at = now_utc()
+        payload = {
+            "plan_ref": self.plan_ref, "evidence_refs": list(self.evidence_refs),
+            "criterion_results": self.criterion_results, "coverage": 0.0,
+            "failed_checks": [], "unknowns": ["project_reality_changed"],
+            "outcome": "not_run", "reason": reason,
+            "checked_at": checked_at.isoformat(),
+        }
+        meta = _revise_meta(self.meta, payload)
+        return VerificationVerdict(
+            meta=meta, plan_ref=self.plan_ref, evidence_refs=self.evidence_refs,
+            criterion_results=self.criterion_results, coverage=0.0,
+            failed_checks=(), unknowns=("project_reality_changed",),
+            outcome="not_run", reason=reason, checked_at=checked_at,
+        )
+
 
 @dataclass(frozen=True)
 class CompletionVerdict:
@@ -1039,3 +1494,189 @@ class CompletionVerdict:
             no_project_side_effect=no_project_side_effect,
             user_effect=user_effect,
         )
+
+    def supersede_for_reality_change(self, verification_ref: str, reason: str) -> CompletionVerdict:
+        """A past completed claim cannot survive a relevant project-state change."""
+        payload = {
+            "task_revision": self.task_revision, "task_run_ref": self.task_run_ref,
+            "verification_ref": verification_ref,
+            "reconciliation_refs": list(self.reconciliation_refs),
+            "candidate_ref": self.candidate_ref, "outcome": "not_completed",
+            "completed_items": [], "incomplete_items": list(self.completed_items),
+            "unverified_items": list(self.completed_items),
+            "residual_risks": [reason], "no_project_side_effect": self.no_project_side_effect,
+            "user_effect": "previous completion superseded after project reality changed",
+        }
+        return CompletionVerdict(
+            meta=_revise_meta(self.meta, payload), task_revision=self.task_revision,
+            task_run_ref=self.task_run_ref, verification_ref=verification_ref,
+            reconciliation_refs=self.reconciliation_refs, candidate_ref=self.candidate_ref,
+            outcome="not_completed", completed_items=(),
+            incomplete_items=self.completed_items, unverified_items=self.completed_items,
+            residual_risks=(reason,), no_project_side_effect=self.no_project_side_effect,
+            user_effect="previous completion superseded after project reality changed",
+        )
+
+
+# --- E7 experience: candidates may influence later candidates, never authority ---
+
+_EXPERIENCE_STATUSES = frozenset({
+    "draft", "candidate", "trial_eligible", "under_trial", "reusable",
+    "conditional", "degraded", "frozen", "retired",
+})
+
+
+@dataclass(frozen=True)
+class ExperienceCandidate:
+    meta: CanonicalMeta
+    source_completion_refs: tuple[str, ...]
+    success_and_failure_facts: tuple[str, ...]
+    lesson: str
+    applicability: tuple[str, ...]
+    contraindications: tuple[str, ...]
+    risk: str
+    confidence: str
+    status: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "ExperienceCandidate")
+        if self.status not in _EXPERIENCE_STATUSES:
+            raise ContractInvalid(f"Invalid ExperienceCandidate status: {self.status}")
+        if self.status not in {"draft", "candidate", "trial_eligible"}:
+            raise ContractInvalid("E7 can only create a non-promoted experience candidate")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, source_completion_refs: tuple[str, ...],
+        success_and_failure_facts: tuple[str, ...], lesson: str,
+        applicability: tuple[str, ...], contraindications: tuple[str, ...],
+        risk: str, confidence: str, status: str = "candidate",
+        candidate_id: str | None = None, causation_ref: str | None = None,
+    ) -> ExperienceCandidate:
+        payload = {
+            "source_completion_refs": list(source_completion_refs),
+            "success_and_failure_facts": list(success_and_failure_facts),
+            "lesson": lesson, "applicability": list(applicability),
+            "contraindications": list(contraindications), "risk": risk,
+            "confidence": confidence, "status": status,
+        }
+        oid = candidate_id or f"{task_id}:experience-candidate:1"
+        meta, _ = _build_meta_and_integrity(
+            "ExperienceCandidate", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return ExperienceCandidate(meta, source_completion_refs, success_and_failure_facts,
+                                   lesson, applicability, contraindications, risk,
+                                   confidence, status)
+
+
+@dataclass(frozen=True)
+class ExperienceMatch:
+    meta: CanonicalMeta
+    task_revision: int
+    candidate_refs: tuple[str, ...]
+    match_reasons: tuple[str, ...]
+    mismatch_reasons: tuple[str, ...]
+    risk_warnings: tuple[str, ...]
+    recommendation: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "ExperienceMatch")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, task_revision: int, candidate_refs: tuple[str, ...],
+        match_reasons: tuple[str, ...], mismatch_reasons: tuple[str, ...],
+        risk_warnings: tuple[str, ...], recommendation: str,
+        match_id: str | None = None, causation_ref: str | None = None,
+    ) -> ExperienceMatch:
+        payload = {
+            "task_revision": task_revision, "candidate_refs": list(candidate_refs),
+            "match_reasons": list(match_reasons), "mismatch_reasons": list(mismatch_reasons),
+            "risk_warnings": list(risk_warnings), "recommendation": recommendation,
+        }
+        oid = match_id or f"{task_id}:experience-match:1"
+        meta, _ = _build_meta_and_integrity(
+            "ExperienceMatch", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return ExperienceMatch(meta, task_revision, candidate_refs, match_reasons,
+                               mismatch_reasons, risk_warnings, recommendation)
+
+
+@dataclass(frozen=True)
+class TrialUseRecord:
+    meta: CanonicalMeta
+    experience_ref: str
+    task_revision: int
+    usage_mode: str
+    influence_ref: str
+    completion_ref: str
+    result: str
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "TrialUseRecord")
+        if self.usage_mode != "candidate_guidance_only":
+            raise ContractInvalid("Experience may only guide a candidate in E7")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, experience_ref: str, task_revision: int,
+        influence_ref: str, completion_ref: str, result: str,
+        record_id: str | None = None, causation_ref: str | None = None,
+    ) -> TrialUseRecord:
+        payload = {
+            "experience_ref": experience_ref, "task_revision": task_revision,
+            "usage_mode": "candidate_guidance_only", "influence_ref": influence_ref,
+            "completion_ref": completion_ref, "result": result,
+        }
+        oid = record_id or f"{task_id}:trial-use:1"
+        meta, _ = _build_meta_and_integrity(
+            "TrialUseRecord", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return TrialUseRecord(meta, experience_ref, task_revision, "candidate_guidance_only",
+                              influence_ref, completion_ref, result)
+
+
+@dataclass(frozen=True)
+class ExperienceLifecycleVerdict:
+    meta: CanonicalMeta
+    experience_ref: str
+    evidence_refs: tuple[str, ...]
+    previous_status: str
+    new_status: str
+    reason: str
+    user_revision_ref: str | None
+
+    def __post_init__(self) -> None:
+        _check_object_type(self, "ExperienceLifecycleVerdict")
+        if self.previous_status not in _EXPERIENCE_STATUSES or self.new_status not in _EXPERIENCE_STATUSES:
+            raise ContractInvalid("Invalid experience lifecycle status")
+        if self.new_status == "reusable":
+            raise ContractInvalid("E7's single second trial may not mark experience reusable")
+
+    @staticmethod
+    def create(
+        run_binding_id: str, task_id: str, task_run_id: str, project_ref: str,
+        correlation_id: str, experience_ref: str, evidence_refs: tuple[str, ...],
+        previous_status: str, new_status: str, reason: str,
+        user_revision_ref: str | None = None, verdict_id: str | None = None,
+        causation_ref: str | None = None,
+    ) -> ExperienceLifecycleVerdict:
+        payload = {
+            "experience_ref": experience_ref, "evidence_refs": list(evidence_refs),
+            "previous_status": previous_status, "new_status": new_status,
+            "reason": reason, "user_revision_ref": user_revision_ref,
+        }
+        oid = verdict_id or f"{task_id}:experience-lifecycle:1"
+        meta, _ = _build_meta_and_integrity(
+            "ExperienceLifecycleVerdict", oid, run_binding_id, task_id, task_run_id,
+            project_ref, correlation_id, payload, causation_ref=causation_ref,
+        )
+        return ExperienceLifecycleVerdict(meta, experience_ref, evidence_refs,
+                                          previous_status, new_status, reason,
+                                          user_revision_ref)

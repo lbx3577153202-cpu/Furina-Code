@@ -92,6 +92,7 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     # From act/active (act→reconcile preserved)
     ("act", "active"): {
         ("reconcile", "active"),
+        ("reconcile", "recovery_review"),
         ("act", "waiting_user"),
         ("act", "external_blocked"),
         ("act", "paused"),
@@ -103,6 +104,7 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("reconcile", "active"): {
         ("deliberate", "active"),
         ("verify", "active"),
+        ("reconcile", "recovery_review"),
         ("reconcile", "waiting_user"),
         ("reconcile", "external_blocked"),
         ("reconcile", "paused"),
@@ -132,8 +134,14 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], set[tuple[str, str]]] = {
     ("adjudicate", "waiting_user"): {("adjudicate", "active")},
     ("adjudicate", "external_blocked"): {("adjudicate", "active")},
     ("adjudicate", "paused"): {("adjudicate", "active")},
-    # Recovery transitions — REJECTED in E3 (no RecoveryVerdict object exists).
-    # E6 will re-add when RecoveryVerdict is implemented.
+    # Recovery is deliberately narrow in E6.  A RecoveryVerdict is required
+    # before leaving recovery_review; no transition here can replay an action.
+    ("reconcile", "recovery_review"): {
+        ("reconcile", "active"),
+        ("reconcile", "paused"),
+        ("reconcile", "manual_intervention"),
+        ("terminal", "terminal"),
+    },
     # Manual intervention — no automatic return
     ("intake", "manual_intervention"): set(),
     ("observe", "manual_intervention"): set(),
