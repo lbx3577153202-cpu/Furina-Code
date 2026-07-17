@@ -18,3 +18,8 @@ runtime/
 *.db
 *.sqlite
 *.sqlite3
+
+# Project source maintenance artifacts
+/_project_source/build/
+/_project_source/local_archive/
+/_project_source/_staging/

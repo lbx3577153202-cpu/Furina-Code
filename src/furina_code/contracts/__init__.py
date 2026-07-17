@@ -13,9 +13,12 @@ from .errors import (
 )
 from .meta import CanonicalMeta, SCHEMA_VERSION, now_utc, compute_integrity_ref, canonical_json_dumps
 from .objects import (
-    RunBinding, TaskDossier, TaskRun, Checkpoint,
+    RunBinding, TaskDossier, TaskRun, Checkpoint, RecoveryVerdict,
     BackendProfile, ContextEnvelope, CandidateEnvelope, ProjectSnapshot,
     EvidenceEnvelope, VerificationPlan, VerificationVerdict, CompletionVerdict,
+    BoundActionPlan, AuthorizationDecision, AuthorizationTicket,
+    EnforcementVerdict, ActionReceipt, RealityReconciliation,
+    ExperienceCandidate, ExperienceMatch, TrialUseRecord, ExperienceLifecycleVerdict,
     OWNER_MAP, check_owner,
 )
 from .states import Phase, Disposition, RunBindingStatus, TaskDossierStatus, is_valid_transition
@@ -39,6 +42,7 @@ __all__ = [
     "TaskDossier",
     "TaskRun",
     "Checkpoint",
+    "RecoveryVerdict",
     "BackendProfile",
     "ContextEnvelope",
     "CandidateEnvelope",
@@ -47,6 +51,16 @@ __all__ = [
     "VerificationPlan",
     "VerificationVerdict",
     "CompletionVerdict",
+    "BoundActionPlan",
+    "AuthorizationDecision",
+    "AuthorizationTicket",
+    "EnforcementVerdict",
+    "ActionReceipt",
+    "RealityReconciliation",
+    "ExperienceCandidate",
+    "ExperienceMatch",
+    "TrialUseRecord",
+    "ExperienceLifecycleVerdict",
     "OWNER_MAP",
     "check_owner",
     "Phase",

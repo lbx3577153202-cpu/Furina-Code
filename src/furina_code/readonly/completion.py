@@ -23,6 +23,7 @@ def create_completion_verdict(
     no_project_side_effect: bool = True,
     user_effect: str = "",
     reconciliation_refs: tuple[str, ...] = (),
+    action_plan_ref: str | None = None,
     envelope_id: str | None = None,
     causation_ref: str | None = None,
 ) -> CompletionVerdict:
@@ -44,6 +45,7 @@ def create_completion_verdict(
         no_project_side_effect=no_project_side_effect,
         user_effect=user_effect,
         reconciliation_refs=reconciliation_refs,
+        action_plan_ref=action_plan_ref,
         envelope_id=envelope_id,
         causation_ref=causation_ref,
     )
