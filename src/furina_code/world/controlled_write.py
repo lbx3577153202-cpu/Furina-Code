@@ -222,6 +222,7 @@ def bind_single_file_create(
     experience_match_ref: str | None = None,
     task_revision: int = 1,
     plan_id: str | None = None,
+    extra_preconditions: tuple[str, ...] = (),
 ) -> BoundActionPlan:
     """Bind the sole E5 operation to one observed project state."""
     if not snapshot.is_clean:
@@ -230,6 +231,7 @@ def bind_single_file_create(
         raise ContractInvalid("E5 content must not be empty")
     if not _allowed_target_path(target_path):
         raise ContractInvalid("E5 target must be one .txt file directly within notes/")
+    preconditions = ("baseline_clean", "target_absent") + extra_preconditions
     return BoundActionPlan.create(
         run_binding_id=snapshot.meta.run_binding_id,
         task_id=snapshot.meta.task_id,
@@ -245,7 +247,7 @@ def bind_single_file_create(
         expected_diff={"created_path": target_path, "content_sha256": _content_sha256(content)},
         risk="low",
         rollback_or_compensation="remove only the created target after a new authorization",
-        preconditions=("baseline_clean", "target_absent"),
+        preconditions=preconditions,
         experience_match_ref=experience_match_ref,
         plan_id=plan_id,
         causation_ref=snapshot.meta.integrity_ref,
@@ -350,6 +352,14 @@ def execute_single_file_create(
         reasons.append("TaskRun is not act/active")
     if task_run.task_revision != plan.task_revision:
         reasons.append("TaskRun task revision differs from plan")
+    if task_run.meta.run_binding_id != plan.meta.run_binding_id:
+        reasons.append("TaskRun run_binding_id differs from plan")
+    if task_run.meta.task_id != plan.meta.task_id:
+        reasons.append("TaskRun task_id differs from plan")
+    if task_run.meta.correlation_id != plan.meta.correlation_id:
+        reasons.append("TaskRun correlation_id differs from plan")
+    if task_run.meta.project_ref != plan.meta.project_ref:
+        reasons.append("TaskRun project_ref differs from plan")
     if not (ticket.valid_from <= now < ticket.expires_at):
         reasons.append("ticket is outside its validity interval")
     if current_snapshot.snapshot_sha256 != plan.baseline_snapshot_sha256 or not current_snapshot.is_clean:

@@ -132,9 +132,12 @@ class TestB4RealityDrift:
         with pytest.raises(ContractInvalid, match="completed"):
             extract_completed_write_experience(ledger_completion)
 
-        # The old memory object (result.completion) is NOT the authority;
-        # only the ledger revision matters. This test proves the ledger
-        # is the source of truth, not in-memory objects.
+        # Old in-memory completion still says "completed", but with ledger
+        # parameter, extraction must fail because ledger says not_completed
+        assert result.completion.outcome == "completed"
+        with pytest.raises(ContractInvalid, match="not completed in ledger"):
+            extract_completed_write_experience(result.completion, ledger=ledger)
+
         ledger.close()
 
     def test_new_completion_has_not_completed(self, tmp_path):

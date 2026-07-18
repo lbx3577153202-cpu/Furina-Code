@@ -85,6 +85,7 @@ class Ledger:
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        self._atomic_fail_after: int = -1  # -1 = no injection; >=0 = fail after N objects
 
     def open(self) -> None:
         self._conn = sqlite3.connect(self._db_path)
@@ -449,7 +450,14 @@ class Ledger:
             cur = self.conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
 
-            for meta, payload, caller_organ, expected_revision in objects:
+            for i, (meta, payload, caller_organ, expected_revision) in enumerate(objects):
+                # Test-only fault injection: fail after N objects written
+                if self._atomic_fail_after >= 0 and i >= self._atomic_fail_after:
+                    raise LedgerWriteFailed(
+                        f"test injection: atomic failure after {i} objects",
+                        {"injected": True, "failed_at": i},
+                    )
+
                 check_owner(meta.object_type, caller_organ, meta.owner_organ)
 
                 # Read current head

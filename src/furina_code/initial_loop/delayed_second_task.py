@@ -18,29 +18,55 @@ if TYPE_CHECKING:
     from ..ledger import Ledger
 
 
+@dataclass(frozen=True)
+class SecondTaskRequest:
+    """Auditable description of the second task, produced by supplier."""
+    target_path: str
+    content: str
+    source_completion_ref: str
+    experience_ref: str
+
+
 class SecondTaskSupplier:
     """Supplies second task only after first round completion is verified in ledger."""
 
-    def __init__(self, ledger: Ledger, first_task_id: str) -> None:
+    def __init__(
+        self,
+        ledger: Ledger,
+        first_task_id: str,
+        second_target_path: str,
+        second_content: str,
+    ) -> None:
         self._ledger = ledger
         self._first_task_id = first_task_id
+        self._second_target_path = second_target_path
+        self._second_content = second_content
         self._called = False
 
-    def get_second_task(self, run_binding_id: str) -> None:
-        """Called after first completion to signal readiness for second task."""
-        self._called = True
-        # Verify first completion is completed in ledger
+    def get_second_task(self, run_binding_id: str) -> SecondTaskRequest:
+        """Return second task description only if first round completed in ledger.
+
+        Raises ContractInvalid if first round not completed.
+        was_called is only set to True on success.
+        """
         objects = self._ledger.get_latest_for_binding(run_binding_id)
-        found = False
+        found_completion_ref = None
         for meta, payload in objects:
             if meta.object_type == "CompletionVerdict" and meta.task_id == self._first_task_id:
                 if payload.get("outcome") == "completed":
-                    found = True
+                    found_completion_ref = meta.integrity_ref
                     break
-        if not found:
+        if found_completion_ref is None:
             raise ContractInvalid(
                 "Second task supplier: first round completion not verified in ledger"
             )
+        self._called = True
+        return SecondTaskRequest(
+            target_path=self._second_target_path,
+            content=self._second_content,
+            source_completion_ref=found_completion_ref,
+            experience_ref="",  # filled by caller after experience extraction
+        )
 
     @property
     def was_called(self) -> bool:
@@ -92,30 +118,26 @@ def plan_second_task_with_experience(
 
     experience_was_applied = bool(match.candidate_refs)
 
-    # Plan WITHOUT experience (baseline)
+    # Plan WITHOUT experience (baseline) - standard preconditions
     plan_without = bind_single_file_create(
         second_snapshot, f"candidate:{task_id}", second_content,
         target_path=second_target_path, experience_match_ref=None,
         task_revision=task_revision,
     )
 
-    # Plan WITH experience - adds verification step to preconditions
+    # Plan WITH experience - adds "experience_verified" precondition
+    # This changes what the verification chain must check
+    extra_preconditions = ("experience_verified",) if experience_was_applied else ()
     plan_with = bind_single_file_create(
         second_snapshot, f"candidate:{task_id}", second_content,
         target_path=second_target_path,
         experience_match_ref=match.meta.integrity_ref if experience_was_applied else None,
         task_revision=task_revision,
+        extra_preconditions=extra_preconditions,
     )
 
-    # The experience_match_ref is embedded in the plan's canonical payload,
-    # making it part of the integrity hash and auditable.
-    # When experience is applied, the plan carries an additional precondition
-    # that the execution chain must verify.
     experience_match_ref_set = plan_with.experience_match_ref is not None
-
-    # Concrete difference: plan_with has experience_match_ref in payload,
-    # which changes the integrity hash and is part of the formal plan.
-    has_extra_verification = experience_match_ref_set
+    has_extra_verification = bool(extra_preconditions)
 
     return SecondTaskPlan(
         plan_without_experience=plan_without,

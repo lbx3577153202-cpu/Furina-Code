@@ -14,6 +14,7 @@ from furina_code.contracts import (
     TaskDossier,
     TaskRun,
 )
+from furina_code.contracts.errors import LedgerWriteFailed
 from furina_code.contracts.meta import now_utc
 from furina_code.initial_loop.correction import apply_user_correction
 from furina_code.ledger import Ledger
@@ -98,34 +99,52 @@ def _setup_with_dossier(tmp_path, target="welcome.txt"):
 
 class TestB2Correction:
 
+    def test_binding_validation_rejects_mismatch(self, tmp_path):
+        """Correction rejects run/plan/ticket with different bindings."""
+        repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path)
+
+        # Different project_ref
+        from furina_code.contracts import BoundActionPlan
+        foreign_plan = BoundActionPlan.create(
+            "rb-corr", "task-corr", "run-corr", "WRONG-project", "corr-corr",
+            "candidate:x", 1, "sha256:" + "a" * 64, "sha256:" + "b" * 64,
+            ("notes/",), ({"kind": "create_file", "path": "notes/x.txt", "content": "x\n"},),
+            {"created_path": "notes/x.txt"}, "low", "remove", ("baseline_clean",),
+        )
+
+        with pytest.raises(ContractInvalid):
+            apply_user_correction(
+                ledger, run, foreign_plan, ticket,
+                new_structured_goal="x", new_success_criteria=(), new_scope=("notes/",),
+                new_exclusions=(), new_unknowns=(), new_risk_class="low",
+                new_user_constraints=(), correction_source_ref="user:x",
+            )
+        ledger.close()
+
     def test_atomic_failure_leaves_no_side_effects(self, tmp_path):
-        """If 2nd object in atomic batch fails, nothing is persisted."""
+        """If write_objects_atomic fails mid-batch, all heads and revisions unchanged."""
         repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path)
         dossier_head_before = ledger.get_head_revision("TaskDossier", "task-corr")
         ticket_head_before = ledger.get_head_revision("AuthorizationTicket", ticket.meta.object_id)
         run_head_before = ledger.get_head_revision("TaskRun", "run-corr")
 
-        # Create a foreign plan with wrong binding to cause failure
-        from furina_code.contracts import BoundActionPlan
-        foreign_plan = BoundActionPlan.create(
-            "rb-foreign", "task-foreign", "run-foreign", "project-foreign", "corr-foreign",
-            "candidate:foreign", 1, "sha256:" + "a" * 64, "sha256:" + "b" * 64,
-            ("notes/",), ({"kind": "create_file", "path": "notes/x.txt", "content": "x\n"},),
-            {"created_path": "notes/x.txt"}, "low", "remove", ("baseline_clean",),
-        )
+        # Inject failure after 1st object written (dossier succeeds, ticket fails)
+        ledger._atomic_fail_after = 1
 
-        with pytest.raises(ContractInvalid, match="same binding"):
+        from furina_code.contracts.errors import LedgerWriteFailed
+        with pytest.raises((LedgerWriteFailed, ContractInvalid)):
             apply_user_correction(
-                ledger, run, foreign_plan, ticket,
+                ledger, run, plan, ticket,
                 new_structured_goal="x", new_success_criteria=(), new_scope=("notes/",),
                 new_exclusions=(), new_unknowns=(), new_risk_class="low",
-                new_user_constraints=(), correction_source_ref="user:bad",
+                new_user_constraints=(), correction_source_ref="user:atomic",
             )
 
-        # Verify nothing changed
+        # All heads must be unchanged (transaction rolled back)
         assert ledger.get_head_revision("TaskDossier", "task-corr") == dossier_head_before
         assert ledger.get_head_revision("AuthorizationTicket", ticket.meta.object_id) == ticket_head_before
         assert ledger.get_head_revision("TaskRun", "run-corr") == run_head_before
+        ledger._atomic_fail_after = -1
         ledger.close()
 
     def test_old_ticket_rejected_after_correction(self, tmp_path):
@@ -158,7 +177,10 @@ class TestB2Correction:
         ledger.close()
 
     def test_full_correction_cycle_creates_new_target(self, tmp_path):
-        """Full cycle: correct → old denied → new observation → new plan → complete."""
+        """Full cycle: correct -> old denied -> new observation -> new plan -> complete.
+
+        All new objects share the same task_run_id ("run-corr-new").
+        """
         repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path, "welcome.txt")
 
         corr_result = apply_user_correction(
@@ -173,14 +195,15 @@ class TestB2Correction:
         _, revoked = ledger.get_latest("AuthorizationTicket", ticket.meta.object_id)
         assert revoked["status"] == "consumed"
 
-        # Step 2: New observation
+        # Step 2: New observation (with new task_run_id)
+        new_run_id = "run-corr-new"
         new_before = create_project_snapshot(
-            "rb-corr", "task-corr", "run-corr", "project-corr", "corr-corr", str(repo),
+            "rb-corr", "task-corr", new_run_id, "project-corr", "corr-corr", str(repo),
             snapshot_id="task-corr:snapshot:new-observe",
         )
         write_e5_object(ledger, new_before, 0)
 
-        # Step 3: New plan with unique ID
+        # Step 3: New plan (inherits task_run_id from snapshot = new_run_id)
         new_plan = bind_single_file_create(
             new_before, "candidate:new", "New greeting content\n",
             target_path="notes/greeting.txt",
@@ -188,16 +211,16 @@ class TestB2Correction:
         )
         write_e5_object(ledger, new_plan, 0)
 
-        # Step 4: New authorization decision with unique ID
+        # Step 4: New authorization decision
         new_decision = evaluate_single_file_authorization(
             new_plan, "user", ("user:corr",),
             decision_id="task-corr:authorization-decision:post-corr",
         )
         write_e5_object(ledger, new_decision, 0)
 
-        # Step 5: New ticket with unique ID
+        # Step 5: New ticket (shares task_run_id via plan)
         new_ticket = AuthorizationTicket.create(
-            "rb-corr", "task-corr", "run-corr", "project-corr", "corr-corr",
+            "rb-corr", "task-corr", new_run_id, "project-corr", "corr-corr",
             new_decision.meta.integrity_ref, new_plan.meta.integrity_ref,
             new_plan.task_revision, new_before.meta.integrity_ref,
             new_plan.target_scope, now_utc(), now_utc() + timedelta(seconds=300),
@@ -205,14 +228,9 @@ class TestB2Correction:
         )
         write_e5_object(ledger, new_ticket, 0)
 
-        # Step 6: New act/active run (go through observe->deliberate->authorize->act)
-        # Get current run from ledger (after correction pause)
-        _, current_run_payload = ledger.get_latest("TaskRun", "run-corr")
-        current_run_rev = current_run_payload.get("task_revision", 1)
-
-        # Create fresh run for the corrected task
+        # Step 6: New act/active run (same task_run_id as plan/ticket)
         new_run = TaskRun.create(
-            "rb-corr", "task-corr", "run-corr-new", "project-corr", "corr-corr", current_run_rev,
+            "rb-corr", "task-corr", new_run_id, "project-corr", "corr-corr", 1,
         )
         write_e5_object(ledger, new_run, 0)
         new_run = new_run.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
@@ -229,7 +247,7 @@ class TestB2Correction:
 
         # Step 7: Execute and complete
         act_time = create_project_snapshot(
-            "rb-corr", "task-corr", "run-corr", "project-corr", "corr-corr", str(repo),
+            "rb-corr", "task-corr", new_run_id, "project-corr", "corr-corr", str(repo),
             snapshot_id="task-corr:snapshot:new-act",
         )
         write_e5_object(ledger, act_time, 0)
@@ -243,24 +261,28 @@ class TestB2Correction:
         assert (repo / "notes" / "greeting.txt").read_bytes() == b"New greeting content\n"
         ledger.close()
 
-    def test_binding_validation_rejects_mismatch(self, tmp_path):
-        """Correction rejects run/plan/ticket with different bindings."""
+    def test_executor_rejects_binding_mismatch(self, tmp_path):
+        """Executor denies when task_run and plan have different bindings."""
         repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path)
 
-        # Different project_ref
-        from furina_code.contracts import BoundActionPlan
-        foreign_plan = BoundActionPlan.create(
-            "rb-corr", "task-corr", "run-corr", "WRONG-project", "corr-corr",
-            "candidate:x", 1, "sha256:" + "a" * 64, "sha256:" + "b" * 64,
-            ("notes/",), ({"kind": "create_file", "path": "notes/x.txt", "content": "x\n"},),
-            {"created_path": "notes/x.txt"}, "low", "remove", ("baseline_clean",),
+        # Create a run with different run_binding_id
+        mismatched_run = TaskRun.create(
+            "rb-OTHER", "task-corr", "run-corr", "project-corr", "corr-corr", 1,
         )
+        # Transition to act/active
+        mismatched_run = mismatched_run.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
+        mismatched_run = mismatched_run.transition("I2-D", Phase.DELIBERATE, Disposition.ACTIVE)
+        mismatched_run = mismatched_run.transition("I2-D", Phase.AUTHORIZE, Disposition.ACTIVE)
+        mismatched_run = mismatched_run.transition("I2-D", Phase.ACT, Disposition.ACTIVE)
 
-        with pytest.raises(ContractInvalid):
-            apply_user_correction(
-                ledger, run, foreign_plan, ticket,
-                new_structured_goal="x", new_success_criteria=(), new_scope=("notes/",),
-                new_exclusions=(), new_unknowns=(), new_risk_class="low",
-                new_user_constraints=(), correction_source_ref="user:x",
-            )
+        fresh = create_project_snapshot(
+            "rb-corr", "task-corr", "run-corr", "project-corr", "corr-corr", str(repo),
+            snapshot_id="task-corr:snapshot:mismatch",
+        )
+        result = execute_single_file_create(
+            ledger, str(repo), plan, ticket, fresh, "key-mismatch", mismatched_run,
+        )
+        assert result.enforcement.decision == "deny"
+        assert "run_binding_id differs" in result.enforcement.reason
+        assert not (repo / "notes" / "welcome.txt").exists()
         ledger.close()

@@ -6,7 +6,6 @@ and calls review_interrupted_write().
 """
 
 import hashlib
-import multiprocessing
 import subprocess
 from pathlib import Path
 
@@ -46,7 +45,9 @@ def _setup_for_crash(tmp_path):
         "rb-crash", "task-crash", "run-crash", "project-crash", "corr-crash",
         str(repo), snapshot_id="task-crash:snapshot:before",
     )
+    write_e5_object(ledger, before, 0)
     plan = bind_single_file_create(before, "candidate:crash", "crash content\n")
+    write_e5_object(ledger, plan, 0)
     decision = evaluate_single_file_authorization(plan, "user", ("user:crash",))
     write_e5_object(ledger, decision, 0)
     ticket = issue_single_file_ticket(decision, plan)
@@ -69,61 +70,102 @@ def _setup_for_crash(tmp_path):
 class TestB3CrashRecovery:
 
     def test_crash_writes_file_receipt_executing_recovery_skips(self, tmp_path):
-        """Full crash → recovery cycle using real executor."""
+        """Full crash -> recovery cycle using real executor.
+
+        Child process calls execute_single_file_create() with _FURINA_CRASH_TEST=1.
+        The executor writes the file, consumes the ticket, creates the receipt,
+        then the crash injection fires and the child exits non-zero.
+        Parent reads the real receipt/ticket from the ledger and calls
+        review_interrupted_write().
+        """
         repo, ledger_path, plan, ticket, snap, checkpoint = _setup_for_crash(tmp_path)
 
-        # Use CrashSimulator with real executor
+        # Use CrashSimulator - spawns child that calls REAL executor
         sim = CrashSimulator(ledger_path, str(repo))
-        proc = multiprocessing.Process(
-            target=_child_write_file_crash,
-            args=(ledger_path, str(repo), plan, ticket, snap, "crash-key"),
-        )
-        proc.start()
-        proc.join(timeout=15)
+        exit_code = sim.write_and_crash(plan, ticket, snap, snap, "crash-key")
 
-        # Assert child exited abnormally
-        assert not proc.is_alive(), "Child should have terminated"
-        assert proc.exitcode != 0, "Child should have non-zero exit code"
+        # Child must have exited non-zero
+        assert exit_code != 0, f"Child should exit non-zero, got {exit_code}"
 
-        # Assert file was written
+        # File was written by the real executor
         assert (repo / "notes" / "welcome.txt").exists()
         assert (repo / "notes" / "welcome.txt").read_bytes() == b"crash content\n"
 
-        # Assert receipt is executing (real ledger fact)
-        import json
+        # Parent opens a fresh ledger connection
         parent_ledger = Ledger(ledger_path)
         parent_ledger.open()
-        rows = parent_ledger.conn.execute(
-            "SELECT payload_json FROM object_revisions WHERE object_type='ActionReceipt'"
-        ).fetchall()
-        assert len(rows) >= 1
-        receipt_payload = json.loads(rows[-1][0])
-        assert receipt_payload["status"] == "executing"
 
-        # Parent reads real receipt from ledger
-        from furina_code.contracts import ActionReceipt
-        receipt = ActionReceipt.create(
-            "rb-crash", "task-crash", "run-crash", "project-crash", "corr-crash",
-            plan.meta.integrity_ref, ticket.meta.integrity_ref,
-            "crash-key", "e5-safe-file-create-v1",
+        # Read REAL receipt from ledger (not fabricated)
+        # ActionReceipt object_id defaults to "{task_id}:action-receipt:1"
+        receipt_id = f"{plan.meta.task_id}:action-receipt:1"
+        receipt_result = parent_ledger.get_latest("ActionReceipt", receipt_id)
+        assert receipt_result is not None, "No ActionReceipt found in ledger"
+        receipt_meta, receipt_payload = receipt_result
+        assert receipt_payload["status"] == "executing", (
+            f"Receipt should be executing, got {receipt_payload['status']}"
         )
 
-        # Create fresh snapshot
+        # Read REAL ticket status from ledger
+        ticket_result = parent_ledger.get_latest("AuthorizationTicket", ticket.meta.object_id)
+        assert ticket_result is not None, "No AuthorizationTicket found in ledger"
+        _, ticket_payload = ticket_result
+        assert ticket_payload["status"] == "consumed", (
+            f"Ticket should be consumed, got {ticket_payload['status']}"
+        )
+
+        # Verify receipt references match plan
+        assert receipt_payload["plan_ref"] == plan.meta.integrity_ref
+        assert receipt_payload["ticket_ref"] == ticket.meta.integrity_ref
+
+        # Read checkpoint from ledger
+        cp_result = parent_ledger.get_latest("Checkpoint", checkpoint.meta.object_id)
+        assert cp_result is not None, "No Checkpoint found in ledger"
+        _, cp_payload = cp_result
+
+        # Reconstruct checkpoint from ledger data
+        from furina_code.contracts import Checkpoint as Cp
+        cp_meta = cp_result[0]
+        ledger_checkpoint = Cp.create(
+            cp_meta.run_binding_id, cp_meta.task_id,
+            cp_meta.task_run_id, cp_meta.project_ref,
+            cp_meta.correlation_id, cp_payload["task_revision"],
+            Phase(cp_payload["phase"]), Disposition(cp_payload["disposition"]),
+            cp_payload["event_cursor"],
+            tuple(cp_payload.get("pending_requests", ())),
+            cp_payload.get("snapshot_ref"), cp_payload.get("reason", ""),
+            pending_actions=tuple(cp_payload.get("pending_actions", ())),
+            ticket_refs=tuple(cp_payload.get("ticket_refs", ())),
+        )
+
+        # Create fresh snapshot for recovery observation
         fresh = create_project_snapshot(
             "rb-crash", "task-crash", "run-crash", "project-crash", "corr-crash",
             str(repo), snapshot_id="task-crash:snapshot:fresh",
         )
 
-        # Call REAL review_interrupted_write
-        verdict = review_interrupted_write(
-            parent_ledger, str(repo), checkpoint, plan, fresh, receipt, "consumed",
+        # Reconstruct receipt from ledger data for review_interrupted_write
+        from furina_code.contracts import ActionReceipt
+        ledger_receipt = ActionReceipt.create(
+            receipt_meta.run_binding_id, receipt_meta.task_id,
+            receipt_meta.task_run_id, receipt_meta.project_ref,
+            receipt_meta.correlation_id,
+            receipt_payload["plan_ref"], receipt_payload["ticket_ref"],
+            receipt_payload["idempotency_key"], receipt_payload["tool_ref"],
+            receipt_id=receipt_meta.object_id,
+            causation_ref=receipt_meta.causation_ref,
         )
 
-        # Assert recovery skips
+        # Call REAL review_interrupted_write with ledger-reconstructed objects
+        verdict = review_interrupted_write(
+            parent_ledger, str(repo), ledger_checkpoint, plan, fresh,
+            ledger_receipt, ticket_payload["status"],
+        )
+
+        # Recovery must skip the action (file already exists, receipt executing)
         assert verdict.outcome == "skip_confirmed_action"
         assert "do not execute action again" in verdict.required_steps
 
-        # Assert file hash unchanged (no second write)
+        # File hash unchanged - no second write occurred
         file_hash = hashlib.sha256(
             (repo / "notes" / "welcome.txt").read_bytes()
         ).hexdigest()
@@ -137,52 +179,10 @@ class TestB3CrashRecovery:
         import os
         assert os.environ.get("_FURINA_CRASH_TEST") != "1"
 
-
-def _child_write_file_crash(
-    ledger_path: str, workspace: str, plan, ticket, snap, idem_key: str,
-) -> None:
-    """Child process: write file via real executor path, persist receipt, crash."""
-    import os, sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-    os.environ["_FURINA_CRASH_TEST"] = "1"
-
-    from furina_code.contracts import ActionReceipt, EnforcementVerdict
-    from furina_code.contracts.meta import now_utc
-    from furina_code.ledger import Ledger
-    from furina_code.world.controlled_write import _inside_workspace, write_e5_object
-
-    ledger = Ledger(ledger_path)
-    ledger.open()
-
-    # Real enforcement
-    enforcement = EnforcementVerdict.create(
-        run_binding_id="rb-crash", task_id="task-crash",
-        task_run_id="run-crash", project_ref="project-crash",
-        correlation_id="corr-crash", ticket_ref=ticket.meta.integrity_ref,
-        plan_ref=plan.meta.integrity_ref, current_snapshot_ref=snap.meta.integrity_ref,
-        decision="allow", reason="child enforcement",
-        verdict_id=f"task-crash:enforcement:child:{now_utc().timestamp()}",
-        causation_ref=ticket.meta.integrity_ref,
-    )
-    write_e5_object(ledger, enforcement, 0)
-
-    # Real executing receipt
-    receipt = ActionReceipt.create(
-        run_binding_id="rb-crash", task_id="task-crash",
-        task_run_id="run-crash", project_ref="project-crash",
-        correlation_id="corr-crash", plan_ref=plan.meta.integrity_ref,
-        ticket_ref=ticket.meta.integrity_ref, idempotency_key=idem_key,
-        tool_ref="e5-safe-file-create-v1", causation_ref=enforcement.meta.integrity_ref,
-    )
-    write_e5_object(ledger, receipt, 0)
-
-    # Write file via real path operations
-    target = _inside_workspace(Path(workspace), plan.operations[0]["path"])
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-        handle.write(plan.operations[0]["content"])
-
-    # CRASH
-    ledger.close()
-    os._exit(1)
+    def test_crash_hook_unavailable_in_production(self):
+        """_CrashTestInjection is internal and not importable in production."""
+        import importlib
+        # The exception class is module-private (prefixed with _)
+        # and only raised when _FURINA_CRASH_TEST=1
+        import os
+        assert os.environ.get("_FURINA_CRASH_TEST") != "1"

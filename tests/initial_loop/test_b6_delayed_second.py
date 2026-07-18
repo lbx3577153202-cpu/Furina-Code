@@ -46,13 +46,11 @@ class TestB6DelayedSecondTask:
 
     def test_supplier_rejects_before_first_completion(self, tmp_path):
         """Supplier fails if first round not completed in ledger."""
-        from furina_code.world import create_project_snapshot
-
         first_repo = _repo(tmp_path, "first")
         ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
         ledger.open()
 
-        # Start first task but don't complete
+        # Run first task to completion
         first = run_controlled_write_cycle(
             ledger, str(first_repo), run_binding_id="rb-supp", task_id="task-supp-1",
             task_run_id="run-supp-1", project_ref="project-supp", correlation_id="corr-supp",
@@ -61,20 +59,46 @@ class TestB6DelayedSecondTask:
         )
         assert first.completion.outcome == "completed"
 
-        supplier = SecondTaskSupplier(ledger, "task-supp-1")
-        # Supplier should succeed because first is completed
-        supplier.get_second_task("rb-supp")
+        supplier = SecondTaskSupplier(ledger, "task-supp-1", "notes/second.txt", "Second\n")
+        # Supplier succeeds because first is completed
+        request = supplier.get_second_task("rb-supp")
         assert supplier.was_called
+        assert request.target_path == "notes/second.txt"
 
-        # Supplier should fail for a task that doesn't exist
-        bad_supplier = SecondTaskSupplier(ledger, "task-nonexistent")
+        # Supplier fails for a task that doesn't exist
+        bad_supplier = SecondTaskSupplier(ledger, "task-nonexistent", "notes/x.txt", "X\n")
         with pytest.raises(ContractInvalid, match="not verified"):
             bad_supplier.get_second_task("rb-supp")
+        assert not bad_supplier.was_called
+        ledger.close()
+
+    def test_supplier_rejects_when_first_not_completed(self, tmp_path):
+        """Supplier fails when first round exists but is not completed."""
+        first_repo = _repo(tmp_path, "first")
+        ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+        ledger.open()
+
+        # Run first task but sabotage completion
+        first = run_controlled_write_cycle(
+            ledger, str(first_repo), run_binding_id="rb-incomp", task_id="task-incomp-1",
+            task_run_id="run-incomp-1", project_ref="project-incomp", correlation_id="corr-incomp",
+            candidate_ref="candidate:incomp-1", user_authority_refs=("user:incomp",),
+            content="First\n", target_path="notes/first.txt",
+        )
+
+        # Tamper with file to make drift, then invalidate completion
+        (first_repo / "notes" / "first.txt").write_bytes(b"tampered\n")
+        from furina_code.initial_loop.reality_drift import detect_and_invalidate_reality_drift
+        detect_and_invalidate_reality_drift(ledger, first.plan, str(first_repo))
+
+        supplier = SecondTaskSupplier(ledger, "task-incomp-1", "notes/second.txt", "Second\n")
+        with pytest.raises(ContractInvalid, match="not verified"):
+            supplier.get_second_task("rb-incomp")
+        assert not supplier.was_called
         ledger.close()
 
     def test_plan_validates_first_completion_source(self, tmp_path):
         """plan_second_task validates experience source matches completion."""
-        from furina_code.world import create_project_snapshot
         from furina_code.contracts import CompletionVerdict
 
         first_repo = _repo(tmp_path, "first")
@@ -91,6 +115,7 @@ class TestB6DelayedSecondTask:
         experience = extract_completed_write_experience(first.completion)
         write_experience_object(ledger, experience, 0)
 
+        from furina_code.world import create_project_snapshot
         second_before = create_project_snapshot(
             "rb-src-2", "task-src-2", "run-src-2", "project-src", "corr-src",
             str(second_repo), snapshot_id="task-src-2:snapshot:before",
@@ -112,7 +137,7 @@ class TestB6DelayedSecondTask:
         ledger.close()
 
     def test_experience_changes_plan_content(self, tmp_path):
-        """Experience produces concretely different plan."""
+        """Experience produces concretely different plan (different preconditions)."""
         from furina_code.world import create_project_snapshot
 
         first_repo = _repo(tmp_path, "first")
@@ -151,6 +176,10 @@ class TestB6DelayedSecondTask:
         assert result.plan_with_experience.experience_match_ref is not None
         # Integrity hashes differ
         assert result.plan_without_experience.meta.integrity_ref != result.plan_with_experience.meta.integrity_ref
+
+        # Preconditions differ: plan_with has "experience_verified"
+        assert "experience_verified" in result.plan_with_experience.preconditions
+        assert "experience_verified" not in result.plan_without_experience.preconditions
         ledger.close()
 
     def test_no_authority_rejects_even_with_experience(self, tmp_path):
@@ -189,11 +218,11 @@ class TestB6DelayedSecondTask:
             experience_match_ref=match.meta.integrity_ref,
         )
 
-        # No user authority refs → must deny
+        # No user authority refs -> must deny
         decision = evaluate_single_file_authorization(plan, "user", ())
         assert decision.decision == "deny"
 
-        # With authority → allow
+        # With authority -> allow
         decision_auth = evaluate_single_file_authorization(plan, "user", ("user:noauth",))
         assert decision_auth.decision == "allow"
         ledger.close()
@@ -215,8 +244,9 @@ class TestB6DelayedSecondTask:
         write_experience_object(ledger, experience, 0)
 
         # Supplier must be called after first completion
-        supplier = SecondTaskSupplier(ledger, "task-full-1")
-        supplier.get_second_task("rb-full")
+        supplier = SecondTaskSupplier(ledger, "task-full-1", "notes/second.txt", "Second\n")
+        request = supplier.get_second_task("rb-full")
+        assert request.target_path == "notes/second.txt"
 
         match = match_experience_for_second_task(
             experience, run_binding_id="rb-full-2", task_id="task-full-2",

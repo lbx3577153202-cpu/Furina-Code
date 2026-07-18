@@ -132,6 +132,18 @@ def detect_and_invalidate_reality_drift(
     if current_verification is None or current_completion is None:
         raise ContractInvalid("No verification or completion found for this task in ledger")
 
+    # Validate reference chain: completion -> verification
+    # Use ledger-stored integrity_ref (from meta), not recomputed one
+    v_integrity_ref = None
+    for meta, payload in v_objects:
+        if meta.object_type == "VerificationVerdict" and meta.task_id == task_id:
+            v_integrity_ref = meta.integrity_ref
+
+    if v_integrity_ref and current_completion.verification_ref != v_integrity_ref:
+        raise ContractInvalid(
+            "Completion verification_ref does not match current verification integrity_ref"
+        )
+
     # Invalidate using ledger-current objects
     new_verification = current_verification.invalidate_for_reality_change(reason)
     write_e5_object(ledger, new_verification, current_verification.meta.revision)
