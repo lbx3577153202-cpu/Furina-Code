@@ -221,6 +221,7 @@ def bind_single_file_create(
     target_path: str = E5_TARGET_PATH,
     experience_match_ref: str | None = None,
     task_revision: int = 1,
+    plan_id: str | None = None,
 ) -> BoundActionPlan:
     """Bind the sole E5 operation to one observed project state."""
     if not snapshot.is_clean:
@@ -246,6 +247,7 @@ def bind_single_file_create(
         rollback_or_compensation="remove only the created target after a new authorization",
         preconditions=("baseline_clean", "target_absent"),
         experience_match_ref=experience_match_ref,
+        plan_id=plan_id,
         causation_ref=snapshot.meta.integrity_ref,
     )
 
@@ -254,6 +256,7 @@ def evaluate_single_file_authorization(
     plan: BoundActionPlan,
     subject_ref: str,
     user_authority_refs: tuple[str, ...],
+    decision_id: str | None = None,
 ) -> AuthorizationDecision:
     """Apply the frozen E5 static policy; policy decision is not execution."""
     expected_operation = len(plan.operations) == 1 and plan.operations[0].get("kind") == "create_file"
@@ -274,6 +277,7 @@ def evaluate_single_file_authorization(
         decision="allow" if allowed else "deny",
         conditions=("single new file", "exact path", "fresh clean snapshot", "single-use ticket"),
         reason=reason, user_authority_refs=user_authority_refs,
+        decision_id=decision_id,
         causation_ref=plan.meta.integrity_ref,
     )
 

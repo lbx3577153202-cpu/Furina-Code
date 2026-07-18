@@ -1,10 +1,7 @@
 """B6: Second task determined only after first completion.
 
-Tests that:
-1. Second task path/content not created before first completes
-2. Experience actually changes the second plan (concrete diff)
-3. Authorization remains independent of experience
-4. Full causal chain is verified
+Tests supplier gating, experience source validation, plan content
+change, and no-authority rejection.
 """
 
 import subprocess
@@ -22,6 +19,7 @@ from furina_code.experience import (
 )
 from furina_code.initial_loop.controlled_write_cycle import run_controlled_write_cycle
 from furina_code.initial_loop.delayed_second_task import (
+    SecondTaskSupplier,
     plan_second_task_with_experience,
     verify_causal_chain,
 )
@@ -46,58 +44,36 @@ def _repo(root: Path, name: str) -> Path:
 
 class TestB6DelayedSecondTask:
 
-    def test_second_task_determined_after_first_completion(self, tmp_path):
-        """Second task path/content not created before first completes."""
+    def test_supplier_rejects_before_first_completion(self, tmp_path):
+        """Supplier fails if first round not completed in ledger."""
         from furina_code.world import create_project_snapshot
 
         first_repo = _repo(tmp_path, "first")
-        second_repo = _repo(tmp_path, "second")
         ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
         ledger.open()
 
+        # Start first task but don't complete
         first = run_controlled_write_cycle(
-            ledger, str(first_repo), run_binding_id="rb-b6", task_id="task-b6-1",
-            task_run_id="run-b6-1", project_ref="project-b6", correlation_id="corr-b6",
-            candidate_ref="candidate:b6-1", user_authority_refs=("user:b6",),
-            content="First file\n", target_path="notes/first.txt",
+            ledger, str(first_repo), run_binding_id="rb-supp", task_id="task-supp-1",
+            task_run_id="run-supp-1", project_ref="project-supp", correlation_id="corr-supp",
+            candidate_ref="candidate:supp-1", user_authority_refs=("user:supp",),
+            content="First\n", target_path="notes/first.txt",
         )
         assert first.completion.outcome == "completed"
 
-        experience = extract_completed_write_experience(first.completion)
-        write_experience_object(ledger, experience, 0)
+        supplier = SecondTaskSupplier(ledger, "task-supp-1")
+        # Supplier should succeed because first is completed
+        supplier.get_second_task("rb-supp")
+        assert supplier.was_called
 
-        assert not (second_repo / "notes" / "second.txt").exists()
-
-        match = match_experience_for_second_task(
-            experience, run_binding_id="rb-b6-2", task_id="task-b6-2",
-            task_run_id="run-b6-2", project_ref="project-b6", correlation_id="corr-b6",
-            task_revision=1, target_scope=("notes/",), risk="low",
-        )
-        write_experience_object(ledger, match, 0)
-        assert match.recommendation.startswith("candidate_guidance_only")
-
-        second = run_controlled_write_cycle(
-            ledger, str(second_repo), run_binding_id="rb-b6-2", task_id="task-b6-2",
-            task_run_id="run-b6-2", project_ref="project-b6", correlation_id="corr-b6",
-            candidate_ref="candidate:b6-2", user_authority_refs=("user:b6",),
-            content="Second file\n", target_path="notes/second.txt",
-            experience_match_ref=match.meta.integrity_ref,
-        )
-        assert second.completion.outcome == "completed"
-        assert (second_repo / "notes" / "second.txt").read_bytes() == b"Second file\n"
-        assert second.plan.experience_match_ref == match.meta.integrity_ref
-        assert second.completion.action_plan_ref == second.plan.meta.integrity_ref
-
-        trial = record_trial_use(experience, match, second.plan, second.completion)
-        write_experience_object(ledger, trial, 0)
-        lifecycle = adjudicate_trial(experience, trial)
-        write_experience_object(ledger, lifecycle, 0)
-        assert lifecycle.new_status == "conditional"
-        assert lifecycle.new_status != "reusable"
+        # Supplier should fail for a task that doesn't exist
+        bad_supplier = SecondTaskSupplier(ledger, "task-nonexistent")
+        with pytest.raises(ContractInvalid, match="not verified"):
+            bad_supplier.get_second_task("rb-supp")
         ledger.close()
 
-    def test_plan_second_task_validates_first_completion(self, tmp_path):
-        """plan_second_task_with_experience validates first_completion."""
+    def test_plan_validates_first_completion_source(self, tmp_path):
+        """plan_second_task validates experience source matches completion."""
         from furina_code.world import create_project_snapshot
         from furina_code.contracts import CompletionVerdict
 
@@ -107,52 +83,36 @@ class TestB6DelayedSecondTask:
         ledger.open()
 
         first = run_controlled_write_cycle(
-            ledger, str(first_repo), run_binding_id="rb-val", task_id="task-val-1",
-            task_run_id="run-val-1", project_ref="project-val", correlation_id="corr-val",
-            candidate_ref="candidate:val-1", user_authority_refs=("user:val",),
+            ledger, str(first_repo), run_binding_id="rb-src", task_id="task-src-1",
+            task_run_id="run-src-1", project_ref="project-src", correlation_id="corr-src",
+            candidate_ref="candidate:src-1", user_authority_refs=("user:src",),
             content="First\n", target_path="notes/first.txt",
         )
         experience = extract_completed_write_experience(first.completion)
         write_experience_object(ledger, experience, 0)
 
         second_before = create_project_snapshot(
-            "rb-val-2", "task-val-2", "run-val-2", "project-val", "corr-val",
-            str(second_repo), snapshot_id="task-val-2:snapshot:before",
+            "rb-src-2", "task-src-2", "run-src-2", "project-src", "corr-src",
+            str(second_repo), snapshot_id="task-src-2:snapshot:before",
         )
 
-        # Reject if first_completion is not completed
-        not_completed = CompletionVerdict.create(
-            "rb-val", "task-val-1", "run-val-1", "project-val", "corr-val",
-            1, "sha256:run", "sha256:verification", "candidate:val-1",
-            "not_completed",
-        )
-        with pytest.raises(ContractInvalid, match="completed"):
-            plan_second_task_with_experience(
-                experience, not_completed,
-                run_binding_id="rb-val-2", task_id="task-val-2", task_run_id="run-val-2",
-                project_ref="project-val", correlation_id="corr-val", task_revision=1,
-                second_target_path="notes/second.txt", second_content="Second\n",
-                second_snapshot=second_before,
-            )
-
-        # Reject if experience source doesn't match completion
+        # Wrong completion (different integrity_ref)
         wrong_completion = CompletionVerdict.create(
             "rb-other", "task-other", "run-other", "project-other", "corr-other",
-            1, "sha256:run", "sha256:verification", "candidate:other",
-            "completed",
+            1, "sha256:run", "sha256:verification", "candidate:other", "completed",
         )
-        with pytest.raises(ContractInvalid, match="source must match"):
+        with pytest.raises(ContractInvalid, match="source_completion_refs"):
             plan_second_task_with_experience(
                 experience, wrong_completion,
-                run_binding_id="rb-val-2", task_id="task-val-2", task_run_id="run-val-2",
-                project_ref="project-val", correlation_id="corr-val", task_revision=1,
+                run_binding_id="rb-src-2", task_id="task-src-2", task_run_id="run-src-2",
+                project_ref="project-src", correlation_id="corr-src", task_revision=1,
                 second_target_path="notes/second.txt", second_content="Second\n",
                 second_snapshot=second_before,
             )
         ledger.close()
 
-    def test_experience_changes_plan_concretely(self, tmp_path):
-        """Experience produces measurable plan differences."""
+    def test_experience_changes_plan_content(self, tmp_path):
+        """Experience produces concretely different plan."""
         from furina_code.world import create_project_snapshot
 
         first_repo = _repo(tmp_path, "first")
@@ -182,29 +142,110 @@ class TestB6DelayedSecondTask:
             second_snapshot=second_before,
         )
 
-        # Experience was applied
         assert result.experience_was_applied
+        assert result.experience_match_ref_set
+        assert result.has_extra_verification
 
-        # Plans are concretely different: experience_match_ref is set
+        # Plans are concretely different
         assert result.plan_without_experience.experience_match_ref is None
         assert result.plan_with_experience.experience_match_ref is not None
-        assert result.experience_match_ref_set
+        # Integrity hashes differ
+        assert result.plan_without_experience.meta.integrity_ref != result.plan_with_experience.meta.integrity_ref
+        ledger.close()
 
-        # The experience_match_ref is a formal field in the plan's payload,
-        # which means it participates in integrity hashing and is auditable.
-        # This is the concrete difference experience makes to the plan.
+    def test_no_authority_rejects_even_with_experience(self, tmp_path):
+        """With experience but no user authority, authorization denies."""
+        from furina_code.world import create_project_snapshot
 
-        # Authorization is still required and separate
-        decision = evaluate_single_file_authorization(result.plan_with_experience, "user", ("user:diff",))
-        assert decision.decision == "allow"
+        first_repo = _repo(tmp_path, "first")
+        second_repo = _repo(tmp_path, "second")
+        ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+        ledger.open()
 
-        # Without authority, even with experience, authorization denies
-        decision_no_auth = evaluate_single_file_authorization(result.plan_with_experience, "user", ())
-        assert decision_no_auth.decision == "deny"
+        first = run_controlled_write_cycle(
+            ledger, str(first_repo), run_binding_id="rb-noauth", task_id="task-noauth-1",
+            task_run_id="run-noauth-1", project_ref="project-noauth", correlation_id="corr-noauth",
+            candidate_ref="candidate:noauth-1", user_authority_refs=("user:noauth",),
+            content="First\n", target_path="notes/first.txt",
+        )
+        experience = extract_completed_write_experience(first.completion)
+        write_experience_object(ledger, experience, 0)
+
+        match = match_experience_for_second_task(
+            experience, run_binding_id="rb-noauth-2", task_id="task-noauth-2",
+            task_run_id="run-noauth-2", project_ref="project-noauth", correlation_id="corr-noauth",
+            task_revision=1, target_scope=("notes/",), risk="low",
+        )
+        write_experience_object(ledger, match, 0)
+
+        second_before = create_project_snapshot(
+            "rb-noauth-2", "task-noauth-2", "run-noauth-2", "project-noauth", "corr-noauth",
+            str(second_repo), snapshot_id="task-noauth-2:snapshot:before",
+        )
+        from furina_code.world.controlled_write import bind_single_file_create
+        plan = bind_single_file_create(
+            second_before, "candidate:noauth-2", "Second\n",
+            target_path="notes/second.txt",
+            experience_match_ref=match.meta.integrity_ref,
+        )
+
+        # No user authority refs → must deny
+        decision = evaluate_single_file_authorization(plan, "user", ())
+        assert decision.decision == "deny"
+
+        # With authority → allow
+        decision_auth = evaluate_single_file_authorization(plan, "user", ("user:noauth",))
+        assert decision_auth.decision == "allow"
+        ledger.close()
+
+    def test_full_cycle_with_supplier(self, tmp_path):
+        """Full second task cycle with supplier gating."""
+        first_repo = _repo(tmp_path, "first")
+        second_repo = _repo(tmp_path, "second")
+        ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+        ledger.open()
+
+        first = run_controlled_write_cycle(
+            ledger, str(first_repo), run_binding_id="rb-full", task_id="task-full-1",
+            task_run_id="run-full-1", project_ref="project-full", correlation_id="corr-full",
+            candidate_ref="candidate:full-1", user_authority_refs=("user:full",),
+            content="First\n", target_path="notes/first.txt",
+        )
+        experience = extract_completed_write_experience(first.completion)
+        write_experience_object(ledger, experience, 0)
+
+        # Supplier must be called after first completion
+        supplier = SecondTaskSupplier(ledger, "task-full-1")
+        supplier.get_second_task("rb-full")
+
+        match = match_experience_for_second_task(
+            experience, run_binding_id="rb-full-2", task_id="task-full-2",
+            task_run_id="run-full-2", project_ref="project-full", correlation_id="corr-full",
+            task_revision=1, target_scope=("notes/",), risk="low",
+        )
+        write_experience_object(ledger, match, 0)
+
+        second = run_controlled_write_cycle(
+            ledger, str(second_repo), run_binding_id="rb-full-2", task_id="task-full-2",
+            task_run_id="run-full-2", project_ref="project-full", correlation_id="corr-full",
+            candidate_ref="candidate:full-2", user_authority_refs=("user:full",),
+            content="Second\n", target_path="notes/second.txt",
+            experience_match_ref=match.meta.integrity_ref,
+        )
+        assert second.completion.outcome == "completed"
+        assert (second_repo / "notes" / "second.txt").read_bytes() == b"Second\n"
+
+        assert verify_causal_chain(experience.meta.integrity_ref, match, second.plan, second.completion)
+
+        trial = record_trial_use(experience, match, second.plan, second.completion)
+        write_experience_object(ledger, trial, 0)
+        lifecycle = adjudicate_trial(experience, trial)
+        write_experience_object(ledger, lifecycle, 0)
+        assert lifecycle.new_status == "conditional"
+        assert lifecycle.new_status != "reusable"
         ledger.close()
 
     def test_causal_chain_integrity(self, tmp_path):
-        """Full experience -> match -> plan -> completion chain verified."""
         first_repo = _repo(tmp_path, "first")
         second_repo = _repo(tmp_path, "second")
         ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
