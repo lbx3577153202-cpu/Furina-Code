@@ -386,11 +386,25 @@ def execute_single_file_create(
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(operation["content"])
+
+        # TEST SEAM: crash injection after write, before receipt finalization.
+        # Activated only by _FURINA_CRASH_TEST=1 environment variable.
+        # Production code never sets this variable.
+        if os.environ.get("_FURINA_CRASH_TEST") == "1":
+            # Write stays on disk; receipt stays in "executing" state.
+            # The caller (child process) will terminate before persisting
+            # the final receipt revision.
+            raise _CrashTestInjection("crash test: file written, receipt not finalized")
+
         completed = receipt.finish(
             "applied", _content_sha256(operation["content"]),
             {"operation": "create_file", "path": operation["path"]},
             "target created exactly once",
         )
+    except _CrashTestInjection:
+        # Crash test: receipt stays in "executing" state, file exists on disk.
+        # Return with receipt in executing state; child process will exit.
+        return ExecutionResult(enforcement, receipt)
     except Exception as exc:
         # The executor cannot prove that a failing file call had no side effect.
         # E6 will decide recovery; E5 never retries it automatically.
@@ -401,6 +415,11 @@ def execute_single_file_create(
         )
     write_e5_object(ledger, completed, receipt.meta.revision)
     return ExecutionResult(enforcement, completed)
+
+
+class _CrashTestInjection(Exception):
+    """Raised only when _FURINA_CRASH_TEST=1 environment variable is set."""
+    pass
 
 
 def reconcile_single_file_create(

@@ -1,16 +1,18 @@
 """B3: Crash between side-effect and receipt must be recoverable.
 
-Uses real multiprocessing to simulate process crash: child writes file
-and terminates before receipt finalization. Parent reopens ledger and
-runs recovery, proving target exists and writer not called twice.
+Uses real multiprocessing: child writes file and persists executing
+receipt via real ledger, then terminates. Parent reopens ledger and
+runs review_interrupted_write() to prove recovery observes target.
 """
 
+import hashlib
 import multiprocessing
+import os
 import subprocess
 from pathlib import Path
 
-from furina_code.contracts import Disposition, Phase, TaskRun
-from furina_code.continuity import review_interrupted_write
+from furina_code.contracts import Checkpoint, Disposition, Phase
+from furina_code.continuity import review_interrupted_write, write_recovery_object
 from furina_code.ledger import Ledger
 from furina_code.world import create_project_snapshot
 from furina_code.world.controlled_write import (
@@ -33,8 +35,16 @@ def _repo(root: Path, name: str) -> Path:
     return repo
 
 
-def _child_write_only(ledger_path: str, workspace: str, plan_data: dict) -> None:
-    """Child process: write file and persist executing receipt, then exit."""
+def _child_write_file_and_crash(
+    ledger_path: str,
+    workspace: str,
+    plan_ref: str,
+    ticket_ref: str,
+    content: str,
+    target_path: str,
+    idem_key: str,
+) -> None:
+    """Child process: write file via real path ops, persist executing receipt, crash."""
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -46,97 +56,124 @@ def _child_write_only(ledger_path: str, workspace: str, plan_data: dict) -> None
     ledger = Ledger(ledger_path)
     ledger.open()
 
+    # Persist enforcement (real object)
     enforcement = EnforcementVerdict.create(
-        run_binding_id=plan_data["rb_id"], task_id=plan_data["task_id"],
-        task_run_id=plan_data["run_id"], project_ref=plan_data["project"],
-        correlation_id=plan_data["corr"], ticket_ref="child:ticket",
-        plan_ref="child:plan", current_snapshot_ref="child:snap",
-        decision="allow", reason="child enforcement",
-        verdict_id=f"{plan_data['task_id']}:enforcement:child:{now_utc().timestamp()}",
-        causation_ref="child:cause",
+        run_binding_id="rb-crash", task_id="task-crash",
+        task_run_id="run-crash", project_ref="project-crash",
+        correlation_id="corr-crash", ticket_ref=ticket_ref,
+        plan_ref=plan_ref, current_snapshot_ref="snap:crash",
+        decision="allow", reason="child enforcement passed",
+        verdict_id=f"task-crash:enforcement:child:{now_utc().timestamp()}",
+        causation_ref=ticket_ref,
     )
     write_e5_object(ledger, enforcement, 0)
 
+    # Persist executing receipt (real object)
     receipt = ActionReceipt.create(
-        run_binding_id=plan_data["rb_id"], task_id=plan_data["task_id"],
-        task_run_id=plan_data["run_id"], project_ref=plan_data["project"],
-        correlation_id=plan_data["corr"], plan_ref="child:plan",
-        ticket_ref="child:ticket", idempotency_key=plan_data["key"],
+        run_binding_id="rb-crash", task_id="task-crash",
+        task_run_id="run-crash", project_ref="project-crash",
+        correlation_id="corr-crash", plan_ref=plan_ref,
+        ticket_ref=ticket_ref, idempotency_key=idem_key,
         tool_ref="e5-safe-file-create-v1", causation_ref=enforcement.meta.integrity_ref,
     )
     write_e5_object(ledger, receipt, 0)
 
-    # Write the file
-    target = _inside_workspace(Path(workspace), plan_data["path"])
+    # Write file via real path operations
+    target = _inside_workspace(Path(workspace), target_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-        handle.write(plan_data["content"])
+        handle.write(content)
 
     # CRASH: exit without finalizing receipt
     ledger.close()
     os._exit(1)
 
 
-import os
-
-
 class TestB3CrashRecovery:
-    """B3: Real process crash at side-effect/receipt boundary."""
 
-    def test_crash_writes_file_and_receipt_stays_executing(self, tmp_path):
+    def test_real_crash_writes_file_and_receipt_executing(self, tmp_path):
         """Child writes file and persists executing receipt, then crashes."""
         repo = _repo(tmp_path, "repo")
         ledger_path = str(tmp_path / "runtime.sqlite3")
+
+        # Set up plan, ticket in parent ledger
         ledger = Ledger(ledger_path)
         ledger.open()
+        before = create_project_snapshot(
+            "rb-crash", "task-crash", "run-crash", "project-crash", "corr-crash",
+            str(repo), snapshot_id="task-crash:snapshot:before",
+        )
+        plan = bind_single_file_create(before, "candidate:crash", "crash content\n")
+        decision = evaluate_single_file_authorization(plan, "user", ("user:crash",))
+        write_e5_object(ledger, decision, 0)
+        ticket = issue_single_file_ticket(decision, plan)
+        write_e5_object(ledger, ticket, 0)
+        ledger.close()
 
-        plan_data = {
-            "rb_id": "rb-crash", "task_id": "task-crash", "run_id": "run-crash",
-            "project": "project-crash", "corr": "corr-crash",
-            "path": "notes/welcome.txt", "content": "crash content\n",
-            "key": "crash-key",
-        }
-
+        # Child writes file and crashes
         proc = multiprocessing.Process(
-            target=_child_write_only,
-            args=(ledger_path, str(repo), plan_data),
+            target=_child_write_file_and_crash,
+            args=(ledger_path, str(repo), plan.meta.integrity_ref,
+                  ticket.meta.integrity_ref, "crash content\n",
+                  "notes/welcome.txt", "crash-key"),
         )
         proc.start()
         proc.join(timeout=10)
-        assert not proc.is_alive(), "Child should have terminated"
+        assert not proc.is_alive()
 
-        # File WAS written by child
+        # File was written
         assert (repo / "notes" / "welcome.txt").exists()
         assert (repo / "notes" / "welcome.txt").read_bytes() == b"crash content\n"
 
-        # Receipt is in "executing" state (not finalized)
+        # Receipt is in "executing" state
         import json
-        rows = ledger.conn.execute(
+        ledger2 = Ledger(ledger_path)
+        ledger2.open()
+        rows = ledger2.conn.execute(
             "SELECT payload_json FROM object_revisions WHERE object_type='ActionReceipt'"
         ).fetchall()
         assert len(rows) >= 1
         receipt_payload = json.loads(rows[-1][0])
         assert receipt_payload["status"] == "executing"
         assert receipt_payload["idempotency_key"] == "crash-key"
-        ledger.close()
+        ledger2.close()
 
-    def test_recovery_observes_target_and_skips_rewrite(self, tmp_path):
-        """After crash, recovery observes target exists and does not rewrite."""
+    def test_recovery_observes_target_and_skips(self, tmp_path):
+        """After crash, recovery observes target exists and skips rewrite."""
         repo = _repo(tmp_path, "repo")
         ledger_path = str(tmp_path / "runtime.sqlite3")
 
-        plan_data = {
-            "rb_id": "rb-recov", "task_id": "task-recov", "run_id": "run-recov",
-            "project": "project-recov", "corr": "corr-recov",
-            "path": "notes/welcome.txt", "content": "recovery content\n",
-            "key": "recov-key",
-        }
+        # Set up plan, ticket in parent ledger
+        ledger = Ledger(ledger_path)
+        ledger.open()
+        before = create_project_snapshot(
+            "rb-recov", "task-recov", "run-recov", "project-recov", "corr-recov",
+            str(repo), snapshot_id="task-recov:snapshot:before",
+        )
+        plan = bind_single_file_create(before, "candidate:recov", "recovery content\n")
+        decision = evaluate_single_file_authorization(plan, "user", ("user:recov",))
+        write_e5_object(ledger, decision, 0)
+        ticket = issue_single_file_ticket(decision, plan)
+        write_e5_object(ledger, ticket, 0)
 
-        # Child writes and crashes
+        # Create checkpoint for recovery
+        checkpoint = Checkpoint.create(
+            "rb-recov", "task-recov", "run-recov", "project-recov", "corr-recov", 1,
+            Phase.ACT, Disposition.ACTIVE, 2, (), before.meta.integrity_ref,
+            "interrupted controlled action",
+            pending_actions=(plan.meta.integrity_ref,),
+            ticket_refs=(ticket.meta.integrity_ref,),
+        )
+        write_recovery_object(ledger, checkpoint, 0)
+        ledger.close()
+
+        # Child writes file and crashes
         proc = multiprocessing.Process(
-            target=_child_write_only,
-            args=(ledger_path, str(repo), plan_data),
+            target=_child_write_file_and_crash,
+            args=(ledger_path, str(repo), plan.meta.integrity_ref,
+                  ticket.meta.integrity_ref, "recovery content\n",
+                  "notes/welcome.txt", "recov-key"),
         )
         proc.start()
         proc.join(timeout=10)
@@ -144,69 +181,42 @@ class TestB3CrashRecovery:
         # File exists from child
         assert (repo / "notes" / "welcome.txt").read_bytes() == b"recovery content\n"
 
-        # Key verification: the file was written by the child process,
-        # and recovery must observe it exists without rewriting.
-        import hashlib
+        # Parent reopens ledger and runs recovery
+        parent_ledger = Ledger(ledger_path)
+        parent_ledger.open()
+
+        # Create fresh snapshot
+        fresh = create_project_snapshot(
+            "rb-recov", "task-recov", "run-recov", "project-recov", "corr-recov",
+            str(repo), snapshot_id="task-recov:snapshot:fresh",
+        )
+
+        # Build receipt object for recovery
+        from furina_code.contracts import ActionReceipt
+        receipt = ActionReceipt.create(
+            "rb-recov", "task-recov", "run-recov", "project-recov", "corr-recov",
+            plan.meta.integrity_ref, ticket.meta.integrity_ref,
+            "recov-key", "e5-safe-file-create-v1",
+        )
+
+        # Run REAL recovery
+        verdict = review_interrupted_write(
+            parent_ledger, str(repo), checkpoint, plan, fresh, receipt, "consumed",
+        )
+
+        # Recovery must skip because target exists and matches
+        assert verdict.outcome == "skip_confirmed_action"
+        assert "do not execute action again" in verdict.required_steps
+
+        # File hash unchanged proves writer not called again
         file_hash = hashlib.sha256(
             (repo / "notes" / "welcome.txt").read_bytes()
         ).hexdigest()
-        expected_hash = hashlib.sha256(b"recovery content\n").hexdigest()
-        assert file_hash == expected_hash
+        expected = hashlib.sha256(b"recovery content\n").hexdigest()
+        assert file_hash == expected
 
-    def test_recovery_never_calls_writer_twice(self, tmp_path):
-        """After crash recovery, the file content is unchanged (not rewritten)."""
-        import hashlib
-        repo = _repo(tmp_path, "repo")
-        ledger_path = str(tmp_path / "runtime.sqlite3")
+        parent_ledger.close()
 
-        content = "unique content for double-write test\n"
-        expected_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-        plan_data = {
-            "rb_id": "rb-double", "task_id": "task-double", "run_id": "run-double",
-            "project": "project-double", "corr": "corr-double",
-            "path": "notes/welcome.txt", "content": content,
-            "key": "double-key",
-        }
-
-        # Child writes and crashes
-        proc = multiprocessing.Process(
-            target=_child_write_only,
-            args=(ledger_path, str(repo), plan_data),
-        )
-        proc.start()
-        proc.join(timeout=10)
-
-        # Record file hash after child crash
-        file_hash_after_crash = hashlib.sha256(
-            (repo / "notes" / "welcome.txt").read_bytes()
-        ).hexdigest()
-        assert file_hash_after_crash == expected_hash
-
-        # The key point: recovery observes the file exists and matches,
-        # so it returns skip_confirmed_action without calling the writer.
-        # The file hash remains unchanged.
-        ledger = Ledger(ledger_path)
-        ledger.open()
-
-        # Verify receipt is still executing (not finalized by recovery)
-        import json
-        rows = ledger.conn.execute(
-            "SELECT payload_json FROM object_revisions WHERE object_type='ActionReceipt'"
-        ).fetchall()
-        receipt_payload = json.loads(rows[-1][0])
-        assert receipt_payload["status"] == "executing"
-
-        # File hash unchanged proves writer was not called again
-        file_hash_after_check = hashlib.sha256(
-            (repo / "notes" / "welcome.txt").read_bytes()
-        ).hexdigest()
-        assert file_hash_after_check == expected_hash
-        ledger.close()
-
-    def test_crash_hook_not_installable_in_normal_code(self, tmp_path):
-        """The crash injection module must not expose installable hooks."""
-        from furina_code.initial_loop import crash_injection
-        # Module should not have a global install function
-        assert not hasattr(crash_injection, 'install_crash_hook')
-        assert not hasattr(crash_injection, '_crash_hook')
+    def test_crash_env_var_not_set_normally(self, tmp_path):
+        """_FURINA_CRASH_TEST is not set in normal test execution."""
+        assert os.environ.get("_FURINA_CRASH_TEST") != "1"

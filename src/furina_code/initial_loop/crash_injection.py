@@ -1,10 +1,11 @@
 """B3: Test-only crash injection for side-effect/receipt boundary.
 
-Uses multiprocessing to simulate a real process crash: a child process
-writes the file, then terminates without persisting the final receipt.
-The parent process reopens the ledger and runs recovery.
+Uses multiprocessing with _FURINA_CRASH_TEST=1 environment variable
+to activate the crash seam in the real execute_single_file_create().
+Child process writes file via real E5 executor, then crashes.
+Parent reopens ledger and runs review_interrupted_write().
 
-Production code must NOT expose this module.
+Production code never sets _FURINA_CRASH_TEST.
 """
 
 from __future__ import annotations
@@ -15,48 +16,36 @@ from pathlib import Path
 from typing import Any
 
 
-def _child_write_and_crash(
+def _child_real_executor_crash(
     ledger_path: str,
     workspace: str,
     plan_data: dict[str, Any],
-    ticket_data: dict[str, Any],
-    snapshot_data: dict[str, Any],
     idempotency_key: str,
-    run_data: dict[str, Any],
 ) -> None:
-    """Child process: write file, persist executing receipt, then crash.
+    """Child process: use REAL E5 executor with crash injection.
 
-    This function runs in a separate process. It:
-    1. Opens a fresh ledger
-    2. Runs enforcement checks
-    3. Writes the file
-    4. Persists the receipt in "executing" state
-    5. Terminates WITHOUT finalizing the receipt (simulates crash)
+    Sets _FURINA_CRASH_TEST=1 so execute_single_file_create() will
+    raise after writing the file but before finalizing the receipt.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
 
-    from furina_code.contracts import ActionReceipt, EnforcementVerdict
-    from furina_code.contracts.meta import now_utc
-    from furina_code.ledger import Ledger
-    from furina_code.world.controlled_write import (
-        _idempotency_used,
-        _inside_workspace,
-        _ticket_is_current,
-        write_e5_object,
-    )
+    # Activate crash injection in the real executor
+    os.environ["_FURINA_CRASH_TEST"] = "1"
 
-    ledger = Ledger(ledger_path)
-    ledger.open()
-
-    # Reconstruct objects from serialized data
     from furina_code.contracts import (
         AuthorizationTicket,
         BoundActionPlan,
         ProjectSnapshot,
         TaskRun,
     )
+    from furina_code.ledger import Ledger
+    from furina_code.world.controlled_write import execute_single_file_create
 
+    ledger = Ledger(ledger_path)
+    ledger.open()
+
+    # Reconstruct objects from serialized data using real constructors
     plan = BoundActionPlan.create(
         plan_data["run_binding_id"], plan_data["task_id"], plan_data["task_run_id"],
         plan_data["project_ref"], plan_data["correlation_id"], plan_data["candidate_ref"],
@@ -67,50 +56,44 @@ def _child_write_and_crash(
         tuple(plan_data["preconditions"]),
     )
 
-    # Run enforcement (simplified - skip full reconstruction for test)
-    now = now_utc()
-    enforcement = EnforcementVerdict.create(
-        run_binding_id=plan.meta.run_binding_id, task_id=plan.meta.task_id,
-        task_run_id=plan.meta.task_run_id, project_ref=plan.meta.project_ref,
-        correlation_id=plan.meta.correlation_id, ticket_ref="child:ticket",
-        plan_ref=plan.meta.integrity_ref, current_snapshot_ref="child:snapshot",
-        decision="allow", reason="child process enforcement",
-        verdict_id=f"{plan.meta.task_id}:enforcement:child:{now.timestamp()}",
-        causation_ref="child:cause",
+    ticket = AuthorizationTicket.create(
+        plan_data["run_binding_id"], plan_data["task_id"], plan_data["task_run_id"],
+        plan_data["project_ref"], plan_data["correlation_id"],
+        plan_data["decision_ref"], plan.meta.integrity_ref,
+        plan.task_revision, plan.baseline_snapshot_ref,
+        plan.target_scope, plan_data["valid_from_dt"], plan_data["expires_at_dt"],
+        ticket_id=plan_data["ticket_id"],
     )
-    write_e5_object(ledger, enforcement, 0)
 
-    # Create executing receipt
-    receipt = ActionReceipt.create(
-        run_binding_id=plan.meta.run_binding_id, task_id=plan.meta.task_id,
-        task_run_id=plan.meta.task_run_id, project_ref=plan.meta.project_ref,
-        correlation_id=plan.meta.correlation_id, plan_ref=plan.meta.integrity_ref,
-        ticket_ref="child:ticket", idempotency_key=idempotency_key,
-        tool_ref="e5-safe-file-create-v1", causation_ref=enforcement.meta.integrity_ref,
+    run = TaskRun.create(
+        plan_data["run_binding_id"], plan_data["task_id"], plan_data["run_run_id"],
+        plan_data["project_ref"], plan_data["correlation_id"], plan.task_revision,
     )
-    write_e5_object(ledger, receipt, 0)
 
-    # Write the file
-    target_path = plan.operations[0]["path"]
-    target = _inside_workspace(Path(workspace), target_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-        handle.write(plan.operations[0]["content"])
+    snapshot = ProjectSnapshot.create(
+        plan_data["run_binding_id"], plan_data["task_id"], plan_data["run_run_id"],
+        plan_data["project_ref"], plan_data["correlation_id"], workspace,
+        snapshot_id=plan_data["snapshot_id"],
+    )
+
+    # Use the REAL executor - crash injection activates via env var
+    try:
+        execute_single_file_create(
+            ledger, workspace, plan, ticket, snapshot,
+            idempotency_key, run,
+        )
+    except SystemExit:
+        pass  # Expected from os._exit
+    except Exception:
+        pass  # Crash test may raise
 
     # CRASH: terminate without finalizing receipt
-    # The receipt stays in "executing" state
     ledger.close()
-    os._exit(1)  # Simulate abrupt process termination
+    os._exit(1)
 
 
 class CrashSimulator:
-    """Test-only simulator that spawns a child process to write and crash.
-
-    The child writes the file and persists an executing receipt,
-    then terminates abruptly. The parent can then reopen the ledger
-    and run recovery.
-    """
+    """Test-only simulator using real E5 executor with crash injection."""
 
     def __init__(self, ledger_path: str, workspace: str) -> None:
         self.ledger_path = ledger_path
@@ -119,9 +102,14 @@ class CrashSimulator:
     def write_and_crash(
         self,
         plan: Any,
+        ticket: Any,
+        snapshot: Any,
+        run: Any,
         idempotency_key: str,
     ) -> None:
-        """Spawn child process that writes file and crashes."""
+        """Spawn child process that uses real executor and crashes."""
+        from datetime import timezone
+
         plan_data = {
             "run_binding_id": plan.meta.run_binding_id,
             "task_id": plan.meta.task_id,
@@ -138,14 +126,17 @@ class CrashSimulator:
             "risk": plan.risk,
             "rollback_or_compensation": plan.rollback_or_compensation,
             "preconditions": list(plan.preconditions),
+            "decision_ref": ticket.decision_ref,
+            "ticket_id": ticket.meta.object_id,
+            "valid_from_dt": ticket.valid_from,
+            "expires_at_dt": ticket.expires_at,
+            "run_run_id": run.meta.task_run_id,
+            "snapshot_id": snapshot.meta.object_id,
         }
 
         proc = multiprocessing.Process(
-            target=_child_write_and_crash,
-            args=(
-                self.ledger_path, self.workspace, plan_data,
-                {}, {}, idempotency_key, {},
-            ),
+            target=_child_real_executor_crash,
+            args=(self.ledger_path, self.workspace, plan_data, idempotency_key),
         )
         proc.start()
         proc.join(timeout=10)

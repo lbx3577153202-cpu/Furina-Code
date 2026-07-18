@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..contracts import BoundActionPlan, CompletionVerdict, ExperienceMatch
+from ..contracts import BoundActionPlan, CompletionVerdict, ContractInvalid, ExperienceMatch
 from ..experience.trial import match_experience_for_second_task
 
 if TYPE_CHECKING:
@@ -20,11 +20,12 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class SecondTaskPlan:
     """A second task plan that was influenced by first-round experience."""
-    plan: BoundActionPlan
+    plan_without_experience: BoundActionPlan
+    plan_with_experience: BoundActionPlan
     match: ExperienceMatch
     experience_was_applied: bool
-    match_changed_plan: bool
-    authorization_independent: bool
+    preconditions_differ: bool
+    experience_match_ref_set: bool
 
 
 def plan_second_task_with_experience(
@@ -41,15 +42,19 @@ def plan_second_task_with_experience(
     second_content: str,
     second_snapshot,  # ProjectSnapshot
 ) -> SecondTaskPlan:
-    """Plan the second task using experience from the first completion.
+    """Plan the second task with and without experience for comparison.
 
-    This function:
-    1. Takes the first completion's experience
-    2. Matches it against the second task's parameters
-    3. Creates a plan that may be influenced by the match
-    4. Ensures the match is guidance only, not authorization
+    Validates that first_completion completed successfully and matches
+    the experience source. Returns both plans so caller can observe
+    the concrete difference experience makes.
     """
     from ..world.controlled_write import bind_single_file_create
+
+    # Validate first_completion is actually completed
+    if first_completion.outcome != "completed":
+        raise ContractInvalid("First task must be completed to extract experience")
+    if first_completion.meta.task_id != experience.meta.task_id:
+        raise ContractInvalid("Experience source must match first completion task")
 
     # Match experience for the second task
     match = match_experience_for_second_task(
@@ -64,12 +69,20 @@ def plan_second_task_with_experience(
         risk="low",
     )
 
-    # The match influences the plan but doesn't replace authorization
     experience_was_applied = bool(match.candidate_refs)
-    match_changed_plan = match.recommendation.startswith("candidate_guidance_only")
 
-    # Create the plan with experience match ref
-    plan = bind_single_file_create(
+    # Create plan WITHOUT experience (baseline)
+    plan_without = bind_single_file_create(
+        second_snapshot,
+        f"candidate:{task_id}",
+        second_content,
+        target_path=second_target_path,
+        experience_match_ref=None,
+        task_revision=task_revision,
+    )
+
+    # Create plan WITH experience
+    plan_with = bind_single_file_create(
         second_snapshot,
         f"candidate:{task_id}",
         second_content,
@@ -78,12 +91,17 @@ def plan_second_task_with_experience(
         task_revision=task_revision,
     )
 
+    # Check concrete differences
+    preconditions_differ = plan_without.preconditions != plan_with.preconditions
+    experience_match_ref_set = plan_with.experience_match_ref is not None
+
     return SecondTaskPlan(
-        plan=plan,
+        plan_without_experience=plan_without,
+        plan_with_experience=plan_with,
         match=match,
         experience_was_applied=experience_was_applied,
-        match_changed_plan=match_changed_plan,
-        authorization_independent=True,  # Experience never replaces authorization
+        preconditions_differ=preconditions_differ,
+        experience_match_ref_set=experience_match_ref_set,
     )
 
 
@@ -94,19 +112,12 @@ def verify_causal_chain(
     completion: CompletionVerdict,
 ) -> bool:
     """Verify the experience → match → plan → completion causal chain."""
-    # Experience must be in match candidates
     if experience_ref not in match.candidate_refs:
         return False
-
-    # Plan must reference the match
     if plan.experience_match_ref != match.meta.integrity_ref:
         return False
-
-    # Completion must reference the plan
     if completion.action_plan_ref != plan.meta.integrity_ref:
         return False
-
-    # All must share the same task identity
     if not all([
         match.meta.task_id == completion.meta.task_id,
         match.meta.task_run_id == completion.meta.task_run_id,
@@ -114,5 +125,4 @@ def verify_causal_chain(
         match.meta.correlation_id == completion.meta.correlation_id,
     ]):
         return False
-
     return True

@@ -433,6 +433,154 @@ class Ledger:
                 {"error": str(exc)},
             ) from exc
 
+    def write_objects_atomic(
+        self,
+        objects: list[tuple[CanonicalMeta, dict[str, Any], str, int]],
+    ) -> None:
+        """Write multiple objects in a single transaction.
+
+        Each tuple is (meta, payload, caller_organ, expected_revision).
+        If any write fails, all writes in this batch are rolled back.
+        """
+        if not objects:
+            return
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+
+            for meta, payload, caller_organ, expected_revision in objects:
+                check_owner(meta.object_type, caller_organ, meta.owner_organ)
+
+                # Read current head
+                cur.execute(
+                    "SELECT current_revision FROM object_heads WHERE object_type=? AND object_id=?",
+                    (meta.object_type, meta.object_id),
+                )
+                head_row = cur.fetchone()
+                current_rev = head_row[0] if head_row else 0
+
+                if expected_revision != current_rev:
+                    raise RevisionConflict(
+                        f"expected_revision={expected_revision} but current={current_rev} "
+                        f"for {meta.object_type}:{meta.object_id}",
+                        {"expected": expected_revision, "current": current_rev},
+                    )
+
+                if meta.revision != current_rev + 1:
+                    raise RevisionConflict(
+                        f"revision must be {current_rev + 1}, got {meta.revision}",
+                        {"expected": current_rev + 1, "got": meta.revision},
+                    )
+
+                if current_rev == 0:
+                    if meta.supersedes_ref is not None:
+                        raise ContractInvalid(
+                            "supersedes_ref must be None for initial creation",
+                        )
+                else:
+                    expected_supersedes = f"{meta.object_type}:{meta.object_id}:rev{current_rev}"
+                    if meta.supersedes_ref != expected_supersedes:
+                        raise ContractInvalid(
+                            f"supersedes_ref must be {expected_supersedes}",
+                        )
+
+                if current_rev > 0:
+                    cur.execute(
+                        "SELECT meta_json FROM object_revisions "
+                        "WHERE object_type=? AND object_id=? AND revision=?",
+                        (meta.object_type, meta.object_id, current_rev),
+                    )
+                    prev_row = cur.fetchone()
+                    if prev_row is None:
+                        raise LedgerWriteFailed(
+                            f"Previous revision {current_rev} not found",
+                        )
+                    prev_meta = json.loads(prev_row[0])
+                    new_meta = meta.to_dict()
+                    for field in _STABLE_FIELDS:
+                        if prev_meta.get(field) != new_meta.get(field):
+                            raise BindingMismatch(
+                                f"Stable field '{field}' changed between revisions",
+                            )
+
+                meta_fields = meta.meta_fields_for_integrity()
+                expected_ref = compute_integrity_ref(meta_fields, payload)
+                if meta.integrity_ref != expected_ref:
+                    raise IntegrityCheckFailed(
+                        "integrity_ref does not match computed hash",
+                    )
+
+                meta_json = canonical_json_dumps(meta.to_dict())
+                payload_json = canonical_json_dumps(payload)
+
+                cur.execute(
+                    "INSERT INTO object_revisions "
+                    "(object_type, object_id, revision, meta_json, payload_json, integrity_ref) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (meta.object_type, meta.object_id, meta.revision,
+                     meta_json, payload_json, meta.integrity_ref),
+                )
+                cur.execute(
+                    "INSERT INTO object_heads (object_type, object_id, current_revision) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(object_type, object_id) "
+                    "DO UPDATE SET current_revision=excluded.current_revision",
+                    (meta.object_type, meta.object_id, meta.revision),
+                )
+
+                # Event
+                cur.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM event_envelopes")
+                next_seq = cur.fetchone()[0]
+                now = now_utc()
+                event_id = f"evt:{meta.object_type}:{meta.object_id}:rev{meta.revision}:{now.timestamp()}"
+                event_type = f"{meta.object_type}.{'created' if meta.revision == 1 else 'revised'}"
+                payload_ref = f"sha256:{__import__('hashlib').sha256(canonical_json_dumps(payload).encode('utf-8')).hexdigest()}"
+                event_integrity_fields = {
+                    "event_id": event_id, "event_type": event_type, "sequence": next_seq,
+                    "aggregate_ref": f"{meta.object_type}:{meta.object_id}",
+                    "aggregate_revision": meta.revision, "producer_organ": meta.owner_organ,
+                    "run_binding_id": meta.run_binding_id, "task_run_id": meta.task_run_id,
+                    "correlation_id": meta.correlation_id, "causation_ref": meta.causation_ref,
+                    "occurred_at": meta.created_at.isoformat(), "recorded_at": now.isoformat(),
+                    "payload_ref": payload_ref,
+                }
+                event_integrity = compute_integrity_ref(event_integrity_fields, {})
+                cur.execute(
+                    "INSERT INTO event_envelopes "
+                    "(sequence, event_id, event_type, aggregate_ref, aggregate_revision, "
+                    "producer_organ, run_binding_id, task_run_id, correlation_id, "
+                    "causation_ref, occurred_at, recorded_at, payload_ref, integrity_ref) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (next_seq, event_id, event_type,
+                     f"{meta.object_type}:{meta.object_id}", meta.revision,
+                     meta.owner_organ, meta.run_binding_id, meta.task_run_id,
+                     meta.correlation_id, meta.causation_ref,
+                     meta.created_at.isoformat(), now.isoformat(),
+                     payload_ref, event_integrity),
+                )
+
+            cur.execute("COMMIT")
+
+        except sqlite3.IntegrityError as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise LedgerWriteFailed(
+                "SQLite integrity constraint violated during atomic write",
+                {"sqlite_error": str(exc)},
+            ) from exc
+        except FurinaContractError:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        except Exception as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise LedgerWriteFailed(
+                f"Unexpected error during atomic write: {type(exc).__name__}",
+                {"error": str(exc)},
+            ) from exc
+
     # --------------------------------------------------------------- events
 
     def get_events(self, run_binding_id: str) -> list[dict[str, Any]]:

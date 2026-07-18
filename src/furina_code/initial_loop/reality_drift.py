@@ -3,16 +3,20 @@
 After a successful verified write, the system must observe the real
 filesystem and detect when the target has changed, then invalidate
 old VerificationVerdict and CompletionVerdict.
+
+Expected hash comes from BoundActionPlan.expected_diff, not from
+VerificationVerdict.criterion_results.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from ..contracts import (
+    BoundActionPlan,
     CompletionVerdict,
     ContractInvalid,
     VerificationVerdict,
@@ -34,19 +38,24 @@ class DriftInvalidationResult:
     expected_hash: str
 
 
-def observe_and_detect_drift(
-    workspace: str,
-    target_path: str,
-    expected_content_sha256: str,
-) -> str:
-    """Observe the real filesystem and return current content hash.
+def _safe_resolve(workspace: str, target_path: str) -> Path:
+    """Resolve target path safely, rejecting escape and absolute paths."""
+    p = PurePosixPath(target_path)
+    if p.is_absolute():
+        raise ContractInvalid(f"Absolute path rejected: {target_path}")
+    if ".." in p.parts:
+        raise ContractInvalid(f"Path traversal rejected: {target_path}")
+    resolved = (Path(workspace) / target_path).resolve()
+    workspace_resolved = Path(workspace).resolve()
+    if not str(resolved).startswith(str(workspace_resolved)):
+        raise ContractInvalid(f"Path escapes workspace: {target_path}")
+    return resolved
 
-    This is the key function that reads the actual file, not a
-    caller-provided hash.
-    """
-    target = Path(workspace) / target_path
+
+def observe_target(workspace: str, target_path: str) -> str:
+    """Observe the real filesystem and return current content hash."""
+    target = _safe_resolve(workspace, target_path)
     if not target.is_file():
-        # File was deleted - this is drift
         return "deleted"
     actual_bytes = target.read_bytes()
     return "sha256:" + hashlib.sha256(actual_bytes).hexdigest()
@@ -56,46 +65,36 @@ def detect_and_invalidate_reality_drift(
     ledger: Ledger,
     verification: VerificationVerdict,
     completion: CompletionVerdict,
+    plan: BoundActionPlan,
     workspace: str,
-    target_path: str,
 ) -> DriftInvalidationResult:
-    """Observe real filesystem, detect drift, and invalidate old evidence.
+    """Observe real filesystem, detect drift against plan, and invalidate.
 
-    This function reads the actual file from the workspace, compares it
-    to the expected hash from the verification, and if different,
-    creates new revisions that invalidate the old evidence.
+    Expected hash comes from plan.expected_diff["content_sha256"].
+    Observed hash comes from reading the actual file on disk.
     """
     from ..world.controlled_write import write_e5_object
 
+    # Get target path and expected hash from the plan (persisted fact)
+    target_path = plan.expected_diff.get("created_path", "")
+    expected_hash = plan.expected_diff.get("content_sha256", "")
+    if not target_path or not expected_hash:
+        raise ContractInvalid("Plan missing target path or expected hash")
+
     # Observe the REAL filesystem
-    current_hash = observe_and_detect_drift(workspace, target_path, "")
+    observed_hash = observe_target(workspace, target_path)
 
-    # Get expected hash from verification evidence
-    expected_hash = ""
-    for check, result in verification.criterion_results.items():
-        if check == "target_content_exact" and result == "pass":
-            # The evidence was about content being exact
-            # We need to re-verify against current state
-            break
+    # Compare observed vs expected
+    if observed_hash == expected_hash:
+        raise ContractInvalid("No reality drift detected; target content unchanged")
 
-    # For drift detection, we compare against what was verified
-    # The verification's criterion_results tells us the claim was "pass"
-    # If the file changed, we detect it by re-reading
-    if current_hash == "deleted":
+    if observed_hash == "deleted":
         reason = f"Target file {target_path} was deleted after verification"
     else:
-        # Re-verify: if file exists but content changed, it's drift
-        # We detect drift by checking if the file still matches what was verified
-        # Since we can't know the exact expected hash without the original content,
-        # we use the fact that verification passed - if it still passes, no drift
-        # The drift is detected when we observe the file has changed
-        reason = f"Project reality changed: target {target_path} observed as {current_hash[:16]}..."
-
-    # Check if actual content matches what was verified
-    # The verification passed, so if we re-read and it's different, that's drift
-    # We detect this by checking if the file hash changed since verification
-    if current_hash == verification.criterion_results.get("target_content_exact", ""):
-        raise ContractInvalid("No reality drift detected; target content unchanged")
+        reason = (
+            f"Project reality changed: target {target_path} "
+            f"expected {expected_hash[:16]}..., observed {observed_hash[:16]}..."
+        )
 
     # Invalidate the VerificationVerdict
     new_verification = verification.invalidate_for_reality_change(reason)
@@ -113,7 +112,7 @@ def detect_and_invalidate_reality_drift(
         new_verification_ref=new_verification.meta.integrity_ref,
         new_completion_ref=new_completion.meta.integrity_ref,
         invalidation_reason=reason,
-        observed_hash=current_hash,
+        observed_hash=observed_hash,
         expected_hash=expected_hash,
     )
 

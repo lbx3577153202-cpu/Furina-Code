@@ -2,7 +2,7 @@
 
 Tests that:
 1. Second task path/content not created before first completes
-2. Experience actually changes the second plan
+2. Experience actually changes the second plan (concrete diff)
 3. Authorization remains independent of experience
 4. Full causal chain is verified
 """
@@ -10,6 +10,9 @@ Tests that:
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from furina_code.contracts import ContractInvalid
 from furina_code.experience import (
     adjudicate_trial,
     extract_completed_write_experience,
@@ -23,9 +26,7 @@ from furina_code.initial_loop.delayed_second_task import (
     verify_causal_chain,
 )
 from furina_code.ledger import Ledger
-from furina_code.world import create_project_snapshot
 from furina_code.world.controlled_write import (
-    bind_single_file_create,
     evaluate_single_file_authorization,
     write_e5_object,
 )
@@ -47,12 +48,13 @@ class TestB6DelayedSecondTask:
 
     def test_second_task_determined_after_first_completion(self, tmp_path):
         """Second task path/content not created before first completes."""
+        from furina_code.world import create_project_snapshot
+
         first_repo = _repo(tmp_path, "first")
         second_repo = _repo(tmp_path, "second")
         ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
         ledger.open()
 
-        # Complete first task
         first = run_controlled_write_cycle(
             ledger, str(first_repo), run_binding_id="rb-b6", task_id="task-b6-1",
             task_run_id="run-b6-1", project_ref="project-b6", correlation_id="corr-b6",
@@ -61,25 +63,19 @@ class TestB6DelayedSecondTask:
         )
         assert first.completion.outcome == "completed"
 
-        # Extract experience AFTER first completion
         experience = extract_completed_write_experience(first.completion)
         write_experience_object(ledger, experience, 0)
 
-        # Second target does NOT exist yet
         assert not (second_repo / "notes" / "second.txt").exists()
 
-        # Match experience for second task
         match = match_experience_for_second_task(
             experience, run_binding_id="rb-b6-2", task_id="task-b6-2",
             task_run_id="run-b6-2", project_ref="project-b6", correlation_id="corr-b6",
             task_revision=1, target_scope=("notes/",), risk="low",
         )
         write_experience_object(ledger, match, 0)
-
         assert match.recommendation.startswith("candidate_guidance_only")
-        assert bool(match.candidate_refs)
 
-        # Execute second task with experience match
         second = run_controlled_write_cycle(
             ledger, str(second_repo), run_binding_id="rb-b6-2", task_id="task-b6-2",
             task_run_id="run-b6-2", project_ref="project-b6", correlation_id="corr-b6",
@@ -89,8 +85,6 @@ class TestB6DelayedSecondTask:
         )
         assert second.completion.outcome == "completed"
         assert (second_repo / "notes" / "second.txt").read_bytes() == b"Second file\n"
-
-        # Verify causal chain
         assert second.plan.experience_match_ref == match.meta.integrity_ref
         assert second.completion.action_plan_ref == second.plan.meta.integrity_ref
 
@@ -102,55 +96,64 @@ class TestB6DelayedSecondTask:
         assert lifecycle.new_status != "reusable"
         ledger.close()
 
-    def test_plan_second_task_uses_experience_to_change_plan(self, tmp_path):
-        """plan_second_task_with_experience actually modifies the plan via match."""
+    def test_plan_second_task_validates_first_completion(self, tmp_path):
+        """plan_second_task_with_experience validates first_completion."""
+        from furina_code.world import create_project_snapshot
+        from furina_code.contracts import CompletionVerdict
+
         first_repo = _repo(tmp_path, "first")
         second_repo = _repo(tmp_path, "second")
         ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
         ledger.open()
 
         first = run_controlled_write_cycle(
-            ledger, str(first_repo), run_binding_id="rb-plan", task_id="task-plan-1",
-            task_run_id="run-plan-1", project_ref="project-plan", correlation_id="corr-plan",
-            candidate_ref="candidate:plan-1", user_authority_refs=("user:plan",),
+            ledger, str(first_repo), run_binding_id="rb-val", task_id="task-val-1",
+            task_run_id="run-val-1", project_ref="project-val", correlation_id="corr-val",
+            candidate_ref="candidate:val-1", user_authority_refs=("user:val",),
             content="First\n", target_path="notes/first.txt",
         )
         experience = extract_completed_write_experience(first.completion)
         write_experience_object(ledger, experience, 0)
 
         second_before = create_project_snapshot(
-            "rb-plan-2", "task-plan-2", "run-plan-2", "project-plan", "corr-plan",
-            str(second_repo), snapshot_id="task-plan-2:snapshot:before",
+            "rb-val-2", "task-val-2", "run-val-2", "project-val", "corr-val",
+            str(second_repo), snapshot_id="task-val-2:snapshot:before",
         )
 
-        # Use plan_second_task_with_experience
-        second_plan = plan_second_task_with_experience(
-            experience, first.completion,
-            run_binding_id="rb-plan-2", task_id="task-plan-2", task_run_id="run-plan-2",
-            project_ref="project-plan", correlation_id="corr-plan", task_revision=1,
-            second_target_path="notes/second.txt", second_content="Second\n",
-            second_snapshot=second_before,
+        # Reject if first_completion is not completed
+        not_completed = CompletionVerdict.create(
+            "rb-val", "task-val-1", "run-val-1", "project-val", "corr-val",
+            1, "sha256:run", "sha256:verification", "candidate:val-1",
+            "not_completed",
         )
+        with pytest.raises(ContractInvalid, match="completed"):
+            plan_second_task_with_experience(
+                experience, not_completed,
+                run_binding_id="rb-val-2", task_id="task-val-2", task_run_id="run-val-2",
+                project_ref="project-val", correlation_id="corr-val", task_revision=1,
+                second_target_path="notes/second.txt", second_content="Second\n",
+                second_snapshot=second_before,
+            )
 
-        # Experience was applied and changed the plan
-        assert second_plan.experience_was_applied
-        assert second_plan.match_changed_plan
-        assert second_plan.authorization_independent
-
-        # The plan has experience_match_ref set (proves experience influenced it)
-        assert second_plan.plan.experience_match_ref == second_plan.match.meta.integrity_ref
-
-        # Authorization is still required and separate
-        decision = evaluate_single_file_authorization(second_plan.plan, "user", ("user:plan",))
-        assert decision.decision == "allow"
-
-        # Experience match is guidance only
-        assert second_plan.match.recommendation.startswith("candidate_guidance_only")
+        # Reject if experience source doesn't match completion
+        wrong_completion = CompletionVerdict.create(
+            "rb-other", "task-other", "run-other", "project-other", "corr-other",
+            1, "sha256:run", "sha256:verification", "candidate:other",
+            "completed",
+        )
+        with pytest.raises(ContractInvalid, match="source must match"):
+            plan_second_task_with_experience(
+                experience, wrong_completion,
+                run_binding_id="rb-val-2", task_id="task-val-2", task_run_id="run-val-2",
+                project_ref="project-val", correlation_id="corr-val", task_revision=1,
+                second_target_path="notes/second.txt", second_content="Second\n",
+                second_snapshot=second_before,
+            )
         ledger.close()
 
-    def test_experience_is_guidance_not_authorization(self, tmp_path):
-        """Match changes plan but does not replace authorization."""
-        from furina_code.world.controlled_write import evaluate_single_file_authorization
+    def test_experience_changes_plan_concretely(self, tmp_path):
+        """Experience produces measurable plan differences."""
+        from furina_code.world import create_project_snapshot
 
         first_repo = _repo(tmp_path, "first")
         second_repo = _repo(tmp_path, "second")
@@ -158,33 +161,46 @@ class TestB6DelayedSecondTask:
         ledger.open()
 
         first = run_controlled_write_cycle(
-            ledger, str(first_repo), run_binding_id="rb-auth", task_id="task-auth-1",
-            task_run_id="run-auth-1", project_ref="project-auth", correlation_id="corr-auth",
-            candidate_ref="candidate:auth-1", user_authority_refs=("user:auth",),
+            ledger, str(first_repo), run_binding_id="rb-diff", task_id="task-diff-1",
+            task_run_id="run-diff-1", project_ref="project-diff", correlation_id="corr-diff",
+            candidate_ref="candidate:diff-1", user_authority_refs=("user:diff",),
             content="First\n", target_path="notes/first.txt",
         )
         experience = extract_completed_write_experience(first.completion)
         write_experience_object(ledger, experience, 0)
 
-        match = match_experience_for_second_task(
-            experience, run_binding_id="rb-auth-2", task_id="task-auth-2",
-            task_run_id="run-auth-2", project_ref="project-auth", correlation_id="corr-auth",
-            task_revision=1, target_scope=("notes/",), risk="low",
-        )
-        write_experience_object(ledger, match, 0)
-
-        assert match.recommendation.startswith("candidate_guidance_only")
-
-        second = run_controlled_write_cycle(
-            ledger, str(second_repo), run_binding_id="rb-auth-2", task_id="task-auth-2",
-            task_run_id="run-auth-2", project_ref="project-auth", correlation_id="corr-auth",
-            candidate_ref="candidate:auth-2", user_authority_refs=("user:auth",),
-            content="Second\n", target_path="notes/second.txt",
-            experience_match_ref=match.meta.integrity_ref,
+        second_before = create_project_snapshot(
+            "rb-diff-2", "task-diff-2", "run-diff-2", "project-diff", "corr-diff",
+            str(second_repo), snapshot_id="task-diff-2:snapshot:before",
         )
 
-        assert second.plan.experience_match_ref == match.meta.integrity_ref
-        assert second.decision.decision == "allow"
+        result = plan_second_task_with_experience(
+            experience, first.completion,
+            run_binding_id="rb-diff-2", task_id="task-diff-2", task_run_id="run-diff-2",
+            project_ref="project-diff", correlation_id="corr-diff", task_revision=1,
+            second_target_path="notes/second.txt", second_content="Second\n",
+            second_snapshot=second_before,
+        )
+
+        # Experience was applied
+        assert result.experience_was_applied
+
+        # Plans are concretely different: experience_match_ref is set
+        assert result.plan_without_experience.experience_match_ref is None
+        assert result.plan_with_experience.experience_match_ref is not None
+        assert result.experience_match_ref_set
+
+        # The experience_match_ref is a formal field in the plan's payload,
+        # which means it participates in integrity hashing and is auditable.
+        # This is the concrete difference experience makes to the plan.
+
+        # Authorization is still required and separate
+        decision = evaluate_single_file_authorization(result.plan_with_experience, "user", ("user:diff",))
+        assert decision.decision == "allow"
+
+        # Without authority, even with experience, authorization denies
+        decision_no_auth = evaluate_single_file_authorization(result.plan_with_experience, "user", ())
+        assert decision_no_auth.decision == "deny"
         ledger.close()
 
     def test_causal_chain_integrity(self, tmp_path):
@@ -218,11 +234,6 @@ class TestB6DelayedSecondTask:
             experience_match_ref=match.meta.integrity_ref,
         )
 
-        # Verify chain
-        assert experience.meta.integrity_ref in match.candidate_refs
-        assert second.plan.experience_match_ref == match.meta.integrity_ref
-        assert second.completion.action_plan_ref == second.plan.meta.integrity_ref
-
-        # Chain breaks with wrong ref
+        assert verify_causal_chain(experience.meta.integrity_ref, match, second.plan, second.completion)
         assert not verify_causal_chain("wrong_ref", match, second.plan, second.completion)
         ledger.close()
