@@ -63,13 +63,18 @@ def run_controlled_write_cycle(
     content: str,
     target_path: str,
     experience_match_ref: str | None = None,
+    task_revision: int = 1,
+    task_dossier_ref: str | None = None,
 ) -> ControlledWriteCycle:
     """Execute one low-risk file creation through observe→terminal.
 
     Callers must provide explicit user authority.  Every formal object and each
     TaskRun transition is persisted before moving to the next stage.
     """
-    run = TaskRun.create(run_binding_id, task_id, task_run_id, project_ref, correlation_id, 1)
+    run = TaskRun.create(
+        run_binding_id, task_id, task_run_id, project_ref, correlation_id,
+        task_revision, causation_ref=task_dossier_ref,
+    )
     write_e5_object(ledger, run, 0)
     run = _advance(ledger, run, Phase.OBSERVE, ())
     before = create_project_snapshot(
@@ -78,8 +83,10 @@ def run_controlled_write_cycle(
     )
     write_e5_object(ledger, before, 0)
     run = _advance(ledger, run, Phase.DELIBERATE, (before.meta.integrity_ref,))
-    plan = bind_single_file_create(before, candidate_ref, content, target_path=target_path,
-                                   experience_match_ref=experience_match_ref)
+    plan = bind_single_file_create(
+        before, candidate_ref, content, target_path=target_path,
+        experience_match_ref=experience_match_ref, task_revision=task_revision,
+    )
     write_e5_object(ledger, plan, 0)
     run = _advance(ledger, run, Phase.AUTHORIZE, (plan.meta.integrity_ref,))
     decision = evaluate_single_file_authorization(plan, "user", user_authority_refs)

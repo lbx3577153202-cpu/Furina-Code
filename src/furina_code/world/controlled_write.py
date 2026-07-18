@@ -26,6 +26,7 @@ from ..contracts import (
     EvidenceEnvelope,
     EnforcementVerdict,
     RealityReconciliation,
+    TaskDossier,
     TaskRun,
     VerificationPlan,
     VerificationVerdict,
@@ -66,6 +67,16 @@ def _content_sha256(content: str) -> str:
 
 def _payload(obj: Any) -> dict[str, Any]:
     """Canonical payloads for the E5 formal objects written to the ledger."""
+    if isinstance(obj, TaskDossier):
+        return {
+            "source_intent_ref": obj.source_intent_ref,
+            "structured_goal": obj.structured_goal,
+            "success_criteria": list(obj.success_criteria),
+            "scope": list(obj.scope), "exclusions": list(obj.exclusions),
+            "unknowns": list(obj.unknowns), "risk_class": obj.risk_class,
+            "user_constraints": list(obj.user_constraints),
+            "status": obj.status.value,
+        }
     if isinstance(obj, TaskRun):
         return {
             "task_revision": obj.task_revision, "phase": obj.phase.value,
@@ -209,6 +220,7 @@ def bind_single_file_create(
     *,
     target_path: str = E5_TARGET_PATH,
     experience_match_ref: str | None = None,
+    task_revision: int = 1,
 ) -> BoundActionPlan:
     """Bind the sole E5 operation to one observed project state."""
     if not snapshot.is_clean:
@@ -224,7 +236,7 @@ def bind_single_file_create(
         project_ref=snapshot.meta.project_ref,
         correlation_id=snapshot.meta.correlation_id,
         candidate_ref=candidate_ref,
-        task_revision=1,
+        task_revision=task_revision,
         baseline_snapshot_ref=snapshot.meta.integrity_ref,
         baseline_snapshot_sha256=snapshot.snapshot_sha256,
         target_scope=(E5_TARGET_SCOPE,),

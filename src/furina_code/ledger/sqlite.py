@@ -219,6 +219,30 @@ class Ledger:
         # fails integrity, propagate the error instead of returning None.
         return self.get_revision(object_type, object_id, rev)
 
+    def get_latest_for_binding(self, run_binding_id: str) -> tuple[tuple[CanonicalMeta, dict], ...]:
+        """Return every current formal object belonging to one local binding.
+
+        The query deliberately returns only object heads, then reuses
+        :meth:`get_revision` for every row.  A continuity rebuild must never
+        trust a convenience query without re-checking the persisted integrity
+        reference of each object it exposes as local authority.
+        """
+        cur = self.conn.execute(
+            "SELECT revisions.object_type, revisions.object_id, heads.current_revision "
+            "FROM object_revisions AS revisions "
+            "JOIN object_heads AS heads "
+            "  ON heads.object_type=revisions.object_type "
+            " AND heads.object_id=revisions.object_id "
+            " AND heads.current_revision=revisions.revision "
+            "WHERE json_extract(revisions.meta_json, '$.run_binding_id')=? "
+            "ORDER BY revisions.object_type, revisions.object_id",
+            (run_binding_id,),
+        )
+        return tuple(
+            self.get_revision(object_type, object_id, revision)
+            for object_type, object_id, revision in cur.fetchall()
+        )
+
     # --------------------------------------------------------------- write
 
     def _new_event_id(self, meta: CanonicalMeta) -> str:
