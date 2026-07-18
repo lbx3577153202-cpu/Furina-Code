@@ -360,6 +360,8 @@ def execute_single_file_create(
         reasons.append("TaskRun correlation_id differs from plan")
     if task_run.meta.project_ref != plan.meta.project_ref:
         reasons.append("TaskRun project_ref differs from plan")
+    if task_run.meta.task_run_id != plan.meta.task_run_id:
+        reasons.append("TaskRun task_run_id differs from plan")
     if not (ticket.valid_from <= now < ticket.expires_at):
         reasons.append("ticket is outside its validity interval")
     if current_snapshot.snapshot_sha256 != plan.baseline_snapshot_sha256 or not current_snapshot.is_clean:

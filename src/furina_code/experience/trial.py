@@ -65,20 +65,19 @@ def write_experience_object(ledger: Ledger, obj: Any, expected_revision: int) ->
 
 def extract_completed_write_experience(
     completion: CompletionVerdict,
-    ledger: "Ledger | None" = None,
+    ledger: Ledger,
 ) -> ExperienceCandidate:
     """A completion can create a candidate; it cannot promote itself.
 
-    If ledger is provided, verifies the completion is still the current
+    Requires ledger parameter.  Verifies the completion is still the current
     version in the ledger and its outcome is still "completed".
     """
-    if ledger is not None:
-        current = ledger.get_latest("CompletionVerdict", completion.meta.object_id)
-        if current is None:
-            raise ContractInvalid("Completion not found in ledger")
-        _, payload = current
-        if payload.get("outcome") != "completed":
-            raise ContractInvalid("Completion is not completed in ledger current revision")
+    current = ledger.get_latest("CompletionVerdict", completion.meta.object_id)
+    if current is None:
+        raise ContractInvalid("Completion not found in ledger")
+    _, payload = current
+    if payload.get("outcome") != "completed":
+        raise ContractInvalid("Completion is not completed in ledger current revision")
     if completion.outcome != "completed" or completion.no_project_side_effect:
         raise ContractInvalid("Only a completed controlled-write task may produce this E7 experience")
     return ExperienceCandidate.create(

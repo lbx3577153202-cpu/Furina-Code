@@ -19,6 +19,7 @@ from furina_code.experience import (
 )
 from furina_code.initial_loop.controlled_write_cycle import run_controlled_write_cycle
 from furina_code.initial_loop.delayed_second_task import (
+    SecondTaskRequest,
     SecondTaskSupplier,
     plan_second_task_with_experience,
     verify_causal_chain,
@@ -89,7 +90,7 @@ class TestB6DelayedSecondTask:
         # Tamper with file to make drift, then invalidate completion
         (first_repo / "notes" / "first.txt").write_bytes(b"tampered\n")
         from furina_code.initial_loop.reality_drift import detect_and_invalidate_reality_drift
-        detect_and_invalidate_reality_drift(ledger, first.plan, str(first_repo))
+        detect_and_invalidate_reality_drift(ledger, "rb-incomp", "task-incomp-1", str(first_repo))
 
         supplier = SecondTaskSupplier(ledger, "task-incomp-1", "notes/second.txt", "Second\n")
         with pytest.raises(ContractInvalid, match="not verified"):
@@ -112,7 +113,7 @@ class TestB6DelayedSecondTask:
             candidate_ref="candidate:src-1", user_authority_refs=("user:src",),
             content="First\n", target_path="notes/first.txt",
         )
-        experience = extract_completed_write_experience(first.completion)
+        experience = extract_completed_write_experience(first.completion, ledger)
         write_experience_object(ledger, experience, 0)
 
         from furina_code.world import create_project_snapshot
@@ -126,12 +127,15 @@ class TestB6DelayedSecondTask:
             "rb-other", "task-other", "run-other", "project-other", "corr-other",
             1, "sha256:run", "sha256:verification", "candidate:other", "completed",
         )
+        request = SecondTaskRequest(
+            target_path="notes/second.txt", content="Second\n",
+            source_completion_ref=first.completion.meta.integrity_ref, experience_ref="",
+        )
         with pytest.raises(ContractInvalid, match="source_completion_refs"):
             plan_second_task_with_experience(
-                experience, wrong_completion,
+                experience, wrong_completion, request,
                 run_binding_id="rb-src-2", task_id="task-src-2", task_run_id="run-src-2",
                 project_ref="project-src", correlation_id="corr-src", task_revision=1,
-                second_target_path="notes/second.txt", second_content="Second\n",
                 second_snapshot=second_before,
             )
         ledger.close()
@@ -151,7 +155,7 @@ class TestB6DelayedSecondTask:
             candidate_ref="candidate:diff-1", user_authority_refs=("user:diff",),
             content="First\n", target_path="notes/first.txt",
         )
-        experience = extract_completed_write_experience(first.completion)
+        experience = extract_completed_write_experience(first.completion, ledger)
         write_experience_object(ledger, experience, 0)
 
         second_before = create_project_snapshot(
@@ -159,11 +163,14 @@ class TestB6DelayedSecondTask:
             str(second_repo), snapshot_id="task-diff-2:snapshot:before",
         )
 
+        request = SecondTaskRequest(
+            target_path="notes/second.txt", content="Second\n",
+            source_completion_ref=first.completion.meta.integrity_ref, experience_ref="",
+        )
         result = plan_second_task_with_experience(
-            experience, first.completion,
+            experience, first.completion, request,
             run_binding_id="rb-diff-2", task_id="task-diff-2", task_run_id="run-diff-2",
             project_ref="project-diff", correlation_id="corr-diff", task_revision=1,
-            second_target_path="notes/second.txt", second_content="Second\n",
             second_snapshot=second_before,
         )
 
@@ -197,7 +204,7 @@ class TestB6DelayedSecondTask:
             candidate_ref="candidate:noauth-1", user_authority_refs=("user:noauth",),
             content="First\n", target_path="notes/first.txt",
         )
-        experience = extract_completed_write_experience(first.completion)
+        experience = extract_completed_write_experience(first.completion, ledger)
         write_experience_object(ledger, experience, 0)
 
         match = match_experience_for_second_task(
@@ -240,7 +247,7 @@ class TestB6DelayedSecondTask:
             candidate_ref="candidate:full-1", user_authority_refs=("user:full",),
             content="First\n", target_path="notes/first.txt",
         )
-        experience = extract_completed_write_experience(first.completion)
+        experience = extract_completed_write_experience(first.completion, ledger)
         write_experience_object(ledger, experience, 0)
 
         # Supplier must be called after first completion
@@ -287,7 +294,7 @@ class TestB6DelayedSecondTask:
             candidate_ref="candidate:chain-1", user_authority_refs=("user:chain",),
             content="First\n", target_path="notes/first.txt",
         )
-        experience = extract_completed_write_experience(first.completion)
+        experience = extract_completed_write_experience(first.completion, ledger)
         write_experience_object(ledger, experience, 0)
 
         match = match_experience_for_second_task(

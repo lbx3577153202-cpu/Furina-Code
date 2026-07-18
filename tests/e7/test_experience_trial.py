@@ -11,6 +11,7 @@ from furina_code.experience import (
     write_experience_object,
 )
 from furina_code.ledger import Ledger
+from furina_code.world.controlled_write import write_e5_object
 
 
 def _plan(task_id: str, match_ref: str | None = None) -> BoundActionPlan:
@@ -46,10 +47,11 @@ def _completion(task_id: str, outcome: str = "completed", *,
 
 
 def test_independent_second_task_turns_candidate_into_conditional_experience(tmp_path):
-    first = _completion("task-one")
-    experience = extract_completed_write_experience(first)
     ledger = Ledger(str(tmp_path / "experience.sqlite3"))
     ledger.open()
+    first = _completion("task-one")
+    write_e5_object(ledger, first, 0)
+    experience = extract_completed_write_experience(first, ledger)
     write_experience_object(ledger, experience, 0)
 
     match = match_experience_for_second_task(
@@ -74,7 +76,11 @@ def test_independent_second_task_turns_candidate_into_conditional_experience(tmp
 
 
 def test_experience_cannot_validate_itself_on_its_source_task():
-    experience = extract_completed_write_experience(_completion("task-one"))
+    ledger = Ledger(":memory:")
+    ledger.open()
+    comp = _completion("task-one")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
 
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-one", task_id="task-one", task_run_id="run-one-new",
@@ -87,7 +93,11 @@ def test_experience_cannot_validate_itself_on_its_source_task():
 
 
 def test_failed_second_task_degrades_instead_of_promoting_experience():
-    experience = extract_completed_write_experience(_completion("task-one"))
+    ledger = Ledger(":memory:")
+    ledger.open()
+    comp = _completion("task-one")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-two", task_id="task-two", task_run_id="run-two",
         project_ref="project-1", correlation_id="corr-two", task_revision=1,
@@ -103,9 +113,11 @@ def test_failed_second_task_degrades_instead_of_promoting_experience():
 
 
 def test_experience_owner_is_enforced(tmp_path):
-    experience = extract_completed_write_experience(_completion("task-one"))
     ledger = Ledger(str(tmp_path / "experience.sqlite3"))
     ledger.open()
+    comp = _completion("task-one")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     with pytest.raises(AuthorityViolation):
         ledger.write_object(experience.meta, {}, caller_organ="I9-X", expected_revision=0)
     ledger.close()

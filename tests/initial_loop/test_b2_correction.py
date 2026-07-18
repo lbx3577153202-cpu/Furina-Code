@@ -261,15 +261,52 @@ class TestB2Correction:
         assert (repo / "notes" / "greeting.txt").read_bytes() == b"New greeting content\n"
         ledger.close()
 
-    def test_executor_rejects_binding_mismatch(self, tmp_path):
-        """Executor denies when task_run and plan have different bindings."""
+    def test_atomic_failure_at_second_object(self, tmp_path):
+        """If write_objects_atomic fails after 2nd object, all heads unchanged."""
+        repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path)
+        dossier_head = ledger.get_head_revision("TaskDossier", "task-corr")
+        ticket_head = ledger.get_head_revision("AuthorizationTicket", ticket.meta.object_id)
+        run_head = ledger.get_head_revision("TaskRun", "run-corr")
+
+        # Fail after 2 objects (dossier + ticket written, run fails)
+        ledger._atomic_fail_after = 2
+
+        with pytest.raises((LedgerWriteFailed, ContractInvalid)):
+            apply_user_correction(
+                ledger, run, plan, ticket,
+                new_structured_goal="x", new_success_criteria=(), new_scope=("notes/",),
+                new_exclusions=(), new_unknowns=(), new_risk_class="low",
+                new_user_constraints=(), correction_source_ref="user:atomic2",
+            )
+
+        # All heads unchanged (transaction rolled back)
+        assert ledger.get_head_revision("TaskDossier", "task-corr") == dossier_head
+        assert ledger.get_head_revision("AuthorizationTicket", ticket.meta.object_id) == ticket_head
+        assert ledger.get_head_revision("TaskRun", "run-corr") == run_head
+        ledger._atomic_fail_after = -1
+        ledger.close()
+
+    @pytest.mark.parametrize("field,bad_value", [
+        ("run_binding_id", "rb-OTHER"),
+        ("task_id", "task-OTHER"),
+        ("task_run_id", "run-OTHER"),
+        ("project_ref", "project-OTHER"),
+        ("correlation_id", "corr-OTHER"),
+    ])
+    def test_executor_rejects_each_binding_field(self, tmp_path, field, bad_value):
+        """Executor denies when any of the 5 binding fields mismatches."""
         repo, ledger, run, plan, ticket = _setup_with_dossier(tmp_path)
 
-        # Create a run with different run_binding_id
-        mismatched_run = TaskRun.create(
-            "rb-OTHER", "task-corr", "run-corr", "project-corr", "corr-corr", 1,
-        )
-        # Transition to act/active
+        # Create run with one bad field
+        kwargs = {
+            "run_binding_id": "rb-corr",
+            "task_id": "task-corr",
+            "task_run_id": "run-corr",
+            "project_ref": "project-corr",
+            "correlation_id": "corr-corr",
+        }
+        kwargs[field] = bad_value
+        mismatched_run = TaskRun.create(**kwargs, task_revision=1)
         mismatched_run = mismatched_run.transition("I2-D", Phase.OBSERVE, Disposition.ACTIVE)
         mismatched_run = mismatched_run.transition("I2-D", Phase.DELIBERATE, Disposition.ACTIVE)
         mismatched_run = mismatched_run.transition("I2-D", Phase.AUTHORIZE, Disposition.ACTIVE)
@@ -280,9 +317,9 @@ class TestB2Correction:
             snapshot_id="task-corr:snapshot:mismatch",
         )
         result = execute_single_file_create(
-            ledger, str(repo), plan, ticket, fresh, "key-mismatch", mismatched_run,
+            ledger, str(repo), plan, ticket, fresh, f"key-{field}", mismatched_run,
         )
         assert result.enforcement.decision == "deny"
-        assert "run_binding_id differs" in result.enforcement.reason
+        assert field in result.enforcement.reason
         assert not (repo / "notes" / "welcome.txt").exists()
         ledger.close()

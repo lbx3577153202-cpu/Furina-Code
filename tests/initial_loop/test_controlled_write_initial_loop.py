@@ -17,6 +17,7 @@ from furina_code.experience import (
 )
 from furina_code.initial_loop import run_controlled_write_cycle
 from furina_code.ledger import Ledger
+from furina_code.world.controlled_write import write_e5_object
 
 
 def _repo(root: Path, name: str) -> Path:
@@ -47,7 +48,7 @@ def test_initial_loop_completes_two_independent_controlled_tasks_and_conditional
     assert first.task_run.disposition is Disposition.TERMINAL
     assert (first_repo / "notes" / "welcome.txt").read_bytes() == b"Hello from Furina Code.\n"
 
-    experience = extract_completed_write_experience(first.completion)
+    experience = extract_completed_write_experience(first.completion, ledger)
     write_experience_object(ledger, experience, 0)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-two", task_id="task-two", task_run_id="run-two",
@@ -151,9 +152,11 @@ def test_e5_act_time_snapshot_denies_write_on_external_change(tmp_path):
 
 def test_e7_trial_rejects_cross_task_match(tmp_path):
     """Regression: a match from a different task cannot bind to a completion."""
-    experience = extract_completed_write_experience(
-        _make_completion("task-src", "completed")
-    )
+    ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+    ledger.open()
+    comp = _make_completion("task-src", "completed")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-other", task_id="task-other", task_run_id="run-other",
         project_ref="project-other", correlation_id="corr-other", task_revision=1,
@@ -171,9 +174,11 @@ def test_e7_trial_rejects_cross_task_match(tmp_path):
 
 def test_e7_trial_rejects_mismatched_revision(tmp_path):
     """Regression: match and completion must reference the same task revision."""
-    experience = extract_completed_write_experience(
-        _make_completion("task-x", "completed")
-    )
+    ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+    ledger.open()
+    comp = _make_completion("task-x", "completed")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-x", task_id="task-x2", task_run_id="run-x2",
         project_ref="project-x", correlation_id="corr-x", task_revision=1,
@@ -190,9 +195,11 @@ def test_e7_trial_rejects_mismatched_revision(tmp_path):
 
 def test_e7_trial_rejects_completion_without_plan_binding(tmp_path):
     """Regression: even with matching task/run/project, completion without plan binding is rejected."""
-    experience = extract_completed_write_experience(
-        _make_completion("task-no-plan", "completed")
-    )
+    ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+    ledger.open()
+    comp = _make_completion("task-no-plan", "completed")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-no-plan", task_id="task-no-plan2", task_run_id="run-no-plan2",
         project_ref="project-no-plan", correlation_id="corr-no-plan", task_revision=1,
@@ -210,9 +217,11 @@ def test_e7_trial_rejects_completion_without_plan_binding(tmp_path):
 
 def test_e7_second_round_never_reusable(tmp_path):
     """Regression: successful second round must be conditional, never reusable."""
-    experience = extract_completed_write_experience(
-        _make_completion("task-y", "completed")
-    )
+    ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+    ledger.open()
+    comp = _make_completion("task-y", "completed")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-y", task_id="task-y2", task_run_id="run-y2",
         project_ref="project-y", correlation_id="corr-y", task_revision=1,
@@ -230,9 +239,11 @@ def test_e7_second_round_never_reusable(tmp_path):
 
 def test_e7_failed_second_round_degrades(tmp_path):
     """Regression: failed second round must degrade the experience."""
-    experience = extract_completed_write_experience(
-        _make_completion("task-z", "completed")
-    )
+    ledger = Ledger(str(tmp_path / "runtime.sqlite3"))
+    ledger.open()
+    comp = _make_completion("task-z", "completed")
+    write_e5_object(ledger, comp, 0)
+    experience = extract_completed_write_experience(comp, ledger)
     match = match_experience_for_second_task(
         experience, run_binding_id="rb-z", task_id="task-z2", task_run_id="run-z2",
         project_ref="project-z", correlation_id="corr-z", task_revision=1,

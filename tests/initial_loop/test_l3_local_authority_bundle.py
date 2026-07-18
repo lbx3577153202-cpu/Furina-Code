@@ -77,7 +77,7 @@ def test_real_controlled_write_rebuilds_complete_local_authority_after_restart(t
         user_authority_refs=("user:explicit-l3",), content="local authority survives restart\n",
         target_path="notes/welcome.txt", task_dossier_ref=dossier.meta.integrity_ref,
     )
-    experience = extract_completed_write_experience(cycle.completion)
+    experience = extract_completed_write_experience(cycle.completion, ledger)
     write_experience_object(ledger, experience, 0)
     initial_run_meta, _ = ledger.get_revision("TaskRun", "run-l3", 1)
     assert initial_run_meta.causation_ref == dossier.meta.integrity_ref

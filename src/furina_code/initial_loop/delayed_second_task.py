@@ -86,6 +86,7 @@ class SecondTaskPlan:
 def plan_second_task_with_experience(
     experience: ExperienceCandidate,
     first_completion: CompletionVerdict,
+    request: SecondTaskRequest,
     *,
     run_binding_id: str,
     task_id: str,
@@ -93,11 +94,13 @@ def plan_second_task_with_experience(
     project_ref: str,
     correlation_id: str,
     task_revision: int,
-    second_target_path: str,
-    second_content: str,
     second_snapshot,
 ) -> SecondTaskPlan:
-    """Plan second task with experience. Validates first completion source."""
+    """Plan second task with experience. Validates first completion source.
+
+    Accepts SecondTaskRequest from supplier instead of separate path/content.
+    Validates request's source_completion_ref matches first_completion.
+    """
     from ..world.controlled_write import bind_single_file_create
 
     # Validate first_completion completed and matches experience source
@@ -107,6 +110,14 @@ def plan_second_task_with_experience(
         raise ContractInvalid(
             "First completion integrity_ref must be in experience.source_completion_refs"
         )
+    # Validate request's source completion matches first completion
+    if request.source_completion_ref != first_completion.meta.integrity_ref:
+        raise ContractInvalid(
+            "Request source_completion_ref does not match first completion"
+        )
+
+    second_target_path = request.target_path
+    second_content = request.content
 
     match = match_experience_for_second_task(
         experience,

@@ -4,9 +4,8 @@ After a successful verified write, the system must observe the real
 filesystem and detect when the target has changed, then invalidate
 old VerificationVerdict and CompletionVerdict.
 
-Expected hash comes from BoundActionPlan.expected_diff.
-Drift detection and experience extraction use Ledger current revision
-as authority, not caller-provided objects.
+Drift detection reads plan/verification/completion from Ledger as the
+sole authority.  Caller-provided in-memory objects are never trusted.
 """
 
 from __future__ import annotations
@@ -17,10 +16,14 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from ..contracts import (
-    BoundActionPlan,
     CompletionVerdict,
     ContractInvalid,
     VerificationVerdict,
+)
+from ..contracts.loader import (
+    load_bound_action_plan,
+    load_completion_verdict,
+    load_verification_verdict,
 )
 
 if TYPE_CHECKING:
@@ -60,21 +63,47 @@ def observe_target(workspace: str, target_path: str) -> str:
 
 def detect_and_invalidate_reality_drift(
     ledger: Ledger,
-    plan: BoundActionPlan,
+    run_binding_id: str,
+    task_id: str,
     workspace: str,
 ) -> DriftInvalidationResult:
     """Observe filesystem, detect drift, invalidate via ledger current revision.
 
-    Queries ledger for current VerificationVerdict and CompletionVerdict
-    rather than trusting caller-provided objects.
+    Reads plan, verification, and completion from ledger as sole authority.
+    Validates completion->verification reference chain before writing.
     """
     from ..world.controlled_write import write_e5_object
 
+    # Find plan from ledger
+    v_objects = ledger.get_latest_for_binding(run_binding_id)
+    plan_oid = None
+    verification_oid = None
+    completion_oid = None
+    for meta, payload in v_objects:
+        if meta.object_type == "BoundActionPlan" and meta.task_id == task_id:
+            plan_oid = meta.object_id
+        if meta.object_type == "VerificationVerdict" and meta.task_id == task_id:
+            verification_oid = meta.object_id
+        if meta.object_type == "CompletionVerdict" and meta.task_id == task_id:
+            completion_oid = meta.object_id
+
+    if plan_oid is None:
+        raise ContractInvalid("No BoundActionPlan found for this task in ledger")
+    if verification_oid is None or completion_oid is None:
+        raise ContractInvalid("No verification or completion found for this task in ledger")
+
+    # Load objects from ledger using loader (preserves integrity_refs)
+    plan = load_bound_action_plan(ledger, plan_oid)
+    current_verification = load_verification_verdict(ledger, verification_oid)
+    current_completion = load_completion_verdict(ledger, completion_oid)
+
+    # Get expected hash from ledger-loaded plan
     target_path = plan.expected_diff.get("created_path", "")
     expected_hash = plan.expected_diff.get("content_sha256", "")
     if not target_path or not expected_hash:
         raise ContractInvalid("Plan missing target path or expected hash")
 
+    # Observe real filesystem
     observed_hash = observe_target(workspace, target_path)
 
     if observed_hash == expected_hash:
@@ -88,58 +117,8 @@ def detect_and_invalidate_reality_drift(
             f"expected {expected_hash[:16]}..., observed {observed_hash[:16]}..."
         )
 
-    # Query ledger for current revision (authority)
-    task_id = plan.meta.task_id
-    run_binding_id = plan.meta.run_binding_id
-
-    # Find current VerificationVerdict for this task
-    v_objects = ledger.get_latest_for_binding(run_binding_id)
-    current_verification = None
-    current_completion = None
-    for meta, payload in v_objects:
-        if meta.object_type == "VerificationVerdict" and meta.task_id == task_id:
-            current_verification = VerificationVerdict.create(
-                meta.run_binding_id, meta.task_id, meta.task_run_id,
-                meta.project_ref, meta.correlation_id,
-                plan_ref=payload.get("plan_ref", ""),
-                evidence_refs=tuple(payload.get("evidence_refs", [])),
-                criterion_results=payload.get("criterion_results", {}),
-                coverage=payload.get("coverage", 0.0),
-                failed_checks=tuple(payload.get("failed_checks", [])),
-                unknowns=tuple(payload.get("unknowns", [])),
-                outcome=payload.get("outcome", ""),
-                reason=payload.get("reason", ""),
-            )
-        if meta.object_type == "CompletionVerdict" and meta.task_id == task_id:
-            current_completion = CompletionVerdict.create(
-                meta.run_binding_id, meta.task_id, meta.task_run_id,
-                meta.project_ref, meta.correlation_id,
-                task_revision=payload.get("task_revision", 1),
-                task_run_ref=payload.get("task_run_ref", ""),
-                verification_ref=payload.get("verification_ref", ""),
-                candidate_ref=payload.get("candidate_ref", ""),
-                outcome=payload.get("outcome", ""),
-                completed_items=tuple(payload.get("completed_items", [])),
-                incomplete_items=tuple(payload.get("incomplete_items", [])),
-                unverified_items=tuple(payload.get("unverified_items", [])),
-                residual_risks=tuple(payload.get("residual_risks", [])),
-                no_project_side_effect=payload.get("no_project_side_effect", True),
-                user_effect=payload.get("user_effect", ""),
-                reconciliation_refs=tuple(payload.get("reconciliation_refs", [])),
-                action_plan_ref=payload.get("action_plan_ref"),
-            )
-
-    if current_verification is None or current_completion is None:
-        raise ContractInvalid("No verification or completion found for this task in ledger")
-
     # Validate reference chain: completion -> verification
-    # Use ledger-stored integrity_ref (from meta), not recomputed one
-    v_integrity_ref = None
-    for meta, payload in v_objects:
-        if meta.object_type == "VerificationVerdict" and meta.task_id == task_id:
-            v_integrity_ref = meta.integrity_ref
-
-    if v_integrity_ref and current_completion.verification_ref != v_integrity_ref:
+    if current_completion.verification_ref != current_verification.meta.integrity_ref:
         raise ContractInvalid(
             "Completion verification_ref does not match current verification integrity_ref"
         )
@@ -176,23 +155,7 @@ def extract_experience_from_ledger(
     objects = ledger.get_latest_for_binding(run_binding_id)
     for meta, payload in objects:
         if meta.object_type == "CompletionVerdict" and meta.task_id == task_id:
-            return CompletionVerdict.create(
-                meta.run_binding_id, meta.task_id, meta.task_run_id,
-                meta.project_ref, meta.correlation_id,
-                task_revision=payload.get("task_revision", 1),
-                task_run_ref=payload.get("task_run_ref", ""),
-                verification_ref=payload.get("verification_ref", ""),
-                candidate_ref=payload.get("candidate_ref", ""),
-                outcome=payload.get("outcome", ""),
-                completed_items=tuple(payload.get("completed_items", [])),
-                incomplete_items=tuple(payload.get("incomplete_items", [])),
-                unverified_items=tuple(payload.get("unverified_items", [])),
-                residual_risks=tuple(payload.get("residual_risks", [])),
-                no_project_side_effect=payload.get("no_project_side_effect", True),
-                user_effect=payload.get("user_effect", ""),
-                reconciliation_refs=tuple(payload.get("reconciliation_refs", [])),
-                action_plan_ref=payload.get("action_plan_ref"),
-            )
+            return load_completion_verdict(ledger, meta.object_id)
     raise ContractInvalid(f"No CompletionVerdict found for task {task_id}")
 
 
