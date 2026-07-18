@@ -1,7 +1,8 @@
 """B2: Mid-task user correction service.
 
-Atomically invalidates old plan/ticket authority when a user changes direction,
-then forces fresh observation, planning, authorization, and verification.
+Atomically invalidates old plan/ticket authority when a user changes direction.
+Validates all objects belong to the same binding/task, writes revocation fact,
+and forces fresh observation, planning, authorization, and verification.
 """
 
 from __future__ import annotations
@@ -15,10 +16,9 @@ from ..contracts import (
     ContractInvalid,
     Disposition,
     Phase,
+    TaskDossier,
     TaskRun,
 )
-from ..contracts.meta import now_utc
-from .controlled_write_cycle import _advance
 
 if TYPE_CHECKING:
     from ..ledger import Ledger
@@ -31,7 +31,8 @@ class CorrectionResult:
     original_ticket_ref: str
     corrected_dossier_ref: str
     revoked_ticket: AuthorizationTicket
-    updated_run: TaskRun  # The run after correction (may be paused)
+    updated_run: TaskRun
+    correction_fact_ref: str
 
 
 def apply_user_correction(
@@ -49,24 +50,35 @@ def apply_user_correction(
     new_user_constraints: tuple[str, ...],
     correction_source_ref: str,
 ) -> CorrectionResult:
-    """Atomically apply user correction, invalidate old authority, pause task.
+    """Atomically apply user correction with full binding validation.
 
     This operation:
-    1. Creates a new TaskDossier revision with the correction source
-    2. Pauses the current TaskRun, recording superseded refs
-    3. Revokes the old ticket (marks it revoked)
-    4. Returns the result so caller can force re-observation
+    1. Validates all objects belong to the same binding/task/revision
+    2. Creates a new TaskDossier revision with the correction source
+    3. Revokes the old ticket (consumed state)
+    4. Pauses the current TaskRun, recording old plan/ticket/correction refs
+    5. Returns the result so caller can force re-observation
     """
-    from ..contracts import TaskDossier
     from ..world.controlled_write import write_e5_object
 
-    # 1. Find and revise the TaskDossier
+    # 1. Validate binding consistency
+    if run.meta.run_binding_id != plan.meta.run_binding_id:
+        raise ContractInvalid("Run and plan must belong to the same binding")
+    if run.meta.run_binding_id != ticket.meta.run_binding_id:
+        raise ContractInvalid("Run and ticket must belong to the same binding")
+    if run.meta.task_id != plan.meta.task_id:
+        raise ContractInvalid("Run and plan must belong to the same task")
+    if run.meta.task_id != ticket.meta.task_id:
+        raise ContractInvalid("Run and ticket must belong to the same task")
+    if plan.meta.integrity_ref != ticket.plan_ref:
+        raise ContractInvalid("Ticket must reference the plan being corrected")
+
+    # 2. Find and revise the TaskDossier
     dossier_result = ledger.get_latest("TaskDossier", run.meta.task_id)
     if dossier_result is None:
         raise ContractInvalid("No TaskDossier found for this task")
     dossier_meta, dossier_payload = dossier_result
 
-    # Create a new dossier revision with correction
     old_dossier = TaskDossier.create(
         run_binding_id=dossier_meta.run_binding_id,
         task_id=dossier_meta.task_id,
@@ -95,19 +107,23 @@ def apply_user_correction(
     )
     write_e5_object(ledger, new_dossier, old_dossier.meta.revision)
 
-    # 2. Pause the current TaskRun
+    # 3. Revoke the old ticket
+    revoked_ticket = ticket.consume()
+    write_e5_object(ledger, revoked_ticket, ticket.meta.revision)
+
+    # 4. Pause the TaskRun, recording all superseded refs
     if run.disposition == Disposition.ACTIVE:
         paused_run = run.transition(
             "I2-D", run.phase, Disposition.WAITING_USER,
-            current_refs=(plan.meta.integrity_ref,),
+            current_refs=(
+                plan.meta.integrity_ref,
+                ticket.meta.integrity_ref,
+                new_dossier.meta.integrity_ref,
+            ),
         )
         write_e5_object(ledger, paused_run, run.meta.revision)
     else:
         paused_run = run
-
-    # 3. Revoke the old ticket
-    revoked_ticket = ticket.consume()
-    write_e5_object(ledger, revoked_ticket, ticket.meta.revision)
 
     return CorrectionResult(
         original_plan_ref=plan.meta.integrity_ref,
@@ -115,4 +131,5 @@ def apply_user_correction(
         corrected_dossier_ref=new_dossier.meta.integrity_ref,
         revoked_ticket=revoked_ticket,
         updated_run=paused_run,
+        correction_fact_ref=new_dossier.meta.integrity_ref,
     )
